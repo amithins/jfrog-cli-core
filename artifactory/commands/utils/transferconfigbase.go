@@ -82,10 +82,12 @@ func (tcb *TransferConfigBase) CreateServiceManagers(dryRun bool) (err error) {
 // serverDetails - The server to check
 // accessManager - Access Manager to run ping
 func (tcb *TransferConfigBase) ValidateAccessServerConnection(serverDetails *config.ServerDetails, accessManager *access.AccessServicesManager) error {
-	if serverDetails.Password != "" {
-		return errorutils.CheckErrorf("it looks like you configured the '%[1]s' instance with username and password.\n"+
-			"This command can be used with admin Access Token only.\n"+
-			"Please use the 'jf c edit %[1]s' command to configure the Access Token, and then re-run the command", serverDetails.ServerId)
+	// The Access ping endpoint (/access/api/v1/system/ping) requires a Bearer token and
+	// rejects basic auth. When the server is configured with username+password only, skip
+	// the ping — the Artifactory version check already confirmed connectivity and credentials.
+	if serverDetails.AccessToken == "" {
+		log.Debug(fmt.Sprintf("Skipping Access server ping for '%s' (no access token configured; basic auth will be used).", serverDetails.ServerId))
+		return nil
 	}
 
 	if _, err := accessManager.Ping(); err != nil {

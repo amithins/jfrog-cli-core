@@ -33,6 +33,8 @@ const (
 	importStartRetriesIntervalMilliSecs = 10000
 	importPollingTimeout                = 10 * time.Minute
 	importPollingInterval               = 10 * time.Second
+	pingRetries                         = 5
+	pingRetryInterval                   = 5 * time.Second
 	interruptedByUserErr                = "Config transfer was cancelled"
 	minTransferConfigArtifactoryVersion = "6.23.21"
 )
@@ -465,6 +467,11 @@ func (tcc *TransferConfigCommand) createImportPollingAction(rtDetails *httputils
 		newServerDetails.SetUser(tcc.SourceServerDetails.GetUser())
 		newServerDetails.SetPassword(tcc.SourceServerDetails.GetPassword())
 		newServerDetails.SetAccessToken(tcc.SourceServerDetails.GetAccessToken())
+		// Clear refresh tokens so the token-refresh interceptor does not load the target's
+		// (now-invalid) token from the CLI config and override the credentials above.
+		newServerDetails.RefreshToken = ""
+		newServerDetails.ArtifactoryRefreshToken = ""
+		newServerDetails.ArtifactoryTokenRefreshInterval = 0
 
 		tcc.TargetArtifactoryManager, err = utils.CreateServiceManager(newServerDetails, -1, 0, false)
 		if err != nil {
@@ -494,15 +501,29 @@ func (tcc *TransferConfigCommand) updateServerDetails() error {
 	newTargetServerDetails.SshKeyPath = tcc.SourceServerDetails.SshKeyPath
 	newTargetServerDetails.SshPassphrase = tcc.SourceServerDetails.SshPassphrase
 	newTargetServerDetails.AccessToken = tcc.SourceServerDetails.AccessToken
-	newTargetServerDetails.RefreshToken = tcc.SourceServerDetails.RefreshToken
-	newTargetServerDetails.ArtifactoryRefreshToken = tcc.SourceServerDetails.ArtifactoryRefreshToken
-	newTargetServerDetails.ArtifactoryTokenRefreshInterval = tcc.SourceServerDetails.ArtifactoryTokenRefreshInterval
 	newTargetServerDetails.ClientCertPath = tcc.SourceServerDetails.ClientCertPath
 	newTargetServerDetails.ClientCertKeyPath = tcc.SourceServerDetails.ClientCertKeyPath
+	// Do not copy refresh tokens. createAuthConfig() would otherwise register a token-refresh
+	// pre-request that loads the server by ServerId (target) from config and can replace the
+	// token with the target's token. After config import the target's keys are the source's,
+	// so the target's token (from config) fails signature verification and causes 401.
+	newTargetServerDetails.RefreshToken = ""
+	newTargetServerDetails.ArtifactoryRefreshToken = ""
+	newTargetServerDetails.ArtifactoryTokenRefreshInterval = 0
 
-	// Ping to validate the transfer ended successfully
 	pingCmd := generic.NewPingCommand().SetServerDetails(newTargetServerDetails)
-	err := pingCmd.Run()
+	var err error
+	for attempt := 1; attempt <= pingRetries; attempt++ {
+		err = pingCmd.Run()
+		if err == nil {
+			break
+		}
+		if attempt < pingRetries {
+			log.Info(fmt.Sprintf("Ping attempt %d/%d failed: %v. Retrying in %v...", attempt, pingRetries, err, pingRetryInterval))
+			time.Sleep(pingRetryInterval)
+		}
+	}
+
 	if err != nil {
 		return err
 	}
@@ -515,6 +536,12 @@ func (tcc *TransferConfigCommand) updateServerDetails() error {
 		return err
 	}
 	tcc.TargetServerDetails = newTargetServerDetails
+	if tcc.TargetArtifactoryManager, err = utils.CreateServiceManager(newTargetServerDetails, -1, 0, false); err != nil {
+		return err
+	}
+	if tcc.TargetAccessManager, err = utils.CreateAccessServiceManager(newTargetServerDetails, false); err != nil {
+		return err
+	}
 	return nil
 }
 
