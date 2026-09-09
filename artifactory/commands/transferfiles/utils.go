@@ -7,14 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	buildInfoUtils "github.com/jfrog/build-info-go/utils"
-	"github.com/jfrog/gofrog/datastructures"
 	"github.com/jfrog/gofrog/parallel"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/state"
@@ -29,16 +27,11 @@ import (
 	"github.com/jfrog/jfrog-client-go/utils/errorutils"
 	"github.com/jfrog/jfrog-client-go/utils/io/fileutils"
 	"github.com/jfrog/jfrog-client-go/utils/log"
-	"golang.org/x/exp/maps"
 )
 
 const (
-	waitTimeBetweenChunkStatusSeconds   = 3
 	waitTimeBetweenThreadsUpdateSeconds = 20
 	DefaultAqlPaginationLimit           = 10000
-
-	SyncErrorReason     = "un-synchronized chunk status due to network issue"
-	SyncErrorStatusCode = 404
 
 	StopFileName = "stop"
 )
@@ -46,87 +39,6 @@ const (
 var AqlPaginationLimit = DefaultAqlPaginationLimit
 var curChunkBuilderThreads int
 var curChunkUploaderThreads int
-
-type UploadedChunk struct {
-	api.UploadChunkResponse
-	UploadedChunkData
-}
-
-type UploadedChunkData struct {
-	ChunkFiles []api.FileRepresentation
-	TimeSent   time.Time
-}
-
-type ChunksLifeCycleManager struct {
-	// deletedChunksSet stores chunk uuids that have received a 'DONE' response from the source Artifactory instance
-	// It is used to notify the source Artifactory instance that these chunks can be deleted from the source's status map.
-	deletedChunksSet *datastructures.Set[api.ChunkId]
-	// nodeToChunksMap stores a map of the node IDs of the source Artifactory instance,
-	// In each node, we store a map of the chunks that are currently in progress and their matching files.
-	// In case network fails, and the uploaded chunks data is lost,
-	// These chunks files will be written to the errors file using this map.
-	nodeToChunksMap map[api.NodeId]map[api.ChunkId]UploadedChunkData
-}
-
-// Convert to map of nodeID to list of chunk IDs to allow printing it
-func (clcm *ChunksLifeCycleManager) GetNodeIdToChunkIdsMap() map[api.NodeId][]api.ChunkId {
-	nodeIdToChunks := make(map[api.NodeId][]api.ChunkId, len(clcm.nodeToChunksMap))
-	for nodeId, chunks := range clcm.nodeToChunksMap {
-		nodeIdToChunks[nodeId] = maps.Keys(chunks)
-	}
-	return nodeIdToChunks
-}
-
-func (clcm *ChunksLifeCycleManager) GetInProgressTokensSlice() []api.ChunkId {
-	var inProgressTokens []api.ChunkId
-	for _, node := range clcm.nodeToChunksMap {
-		for id := range node {
-			inProgressTokens = append(inProgressTokens, id)
-		}
-	}
-
-	return inProgressTokens
-}
-
-func (clcm *ChunksLifeCycleManager) GetInProgressTokensSliceByNodeId(nodeId api.NodeId) []api.ChunkId {
-	var inProgressTokens []api.ChunkId
-	for chunkId := range clcm.nodeToChunksMap[nodeId] {
-		inProgressTokens = append(inProgressTokens, chunkId)
-	}
-
-	return inProgressTokens
-}
-
-// Save in the TransferRunStatus the chunks that have been in transit for more than 30 minutes.
-// This allows them to be displayed using the '--status' option.
-// stateManager - Transfer state manager
-func (clcm *ChunksLifeCycleManager) StoreStaleChunks(stateManager *state.TransferStateManager) error {
-	var staleChunks []state.StaleChunks
-	for nodeId, chunkIdToData := range clcm.nodeToChunksMap {
-		staleNodeChunks := state.StaleChunks{NodeID: string(nodeId)}
-		for chunkId, uploadedChunkData := range chunkIdToData {
-			if time.Since(uploadedChunkData.TimeSent).Hours() < 0.5 {
-				continue
-			}
-			staleNodeChunk := state.StaleChunk{
-				ChunkID: string(chunkId),
-				Sent:    uploadedChunkData.TimeSent.Unix(),
-			}
-			for _, file := range uploadedChunkData.ChunkFiles {
-				var sizeStr string
-				if file.Size > 0 {
-					sizeStr = " (" + serviceUtils.ConvertIntToStorageSizeString(file.Size) + ")"
-				}
-				staleNodeChunk.Files = append(staleNodeChunk.Files, path.Join(file.Repo, file.Path, file.Name)+sizeStr)
-			}
-			staleNodeChunks.Chunks = append(staleNodeChunks.Chunks, staleNodeChunk)
-		}
-		if len(staleNodeChunks.Chunks) > 0 {
-			staleChunks = append(staleChunks, staleNodeChunks)
-		}
-	}
-	return stateManager.SetStaleChunks(staleChunks)
-}
 
 // Set the JFrog CLI temp dir to be ~/.jfrog/transfer/tmp/
 func initTempDir() (unsetTempDir func(), err error) {
@@ -165,14 +77,6 @@ func createTransferServiceManager(ctx context.Context, serverDetails *config.Ser
 	return utils.CreateServiceManagerWithContext(ctx, serverDetails, false, 0, retries, retriesWaitMilliSecs, time.Minute)
 }
 
-func createSrcRtUserPluginServiceManager(ctx context.Context, sourceRtDetails *config.ServerDetails) (*srcUserPluginService, error) {
-	serviceManager, err := createTransferServiceManager(ctx, sourceRtDetails)
-	if err != nil {
-		return nil, err
-	}
-	return NewSrcUserPluginService(serviceManager.GetConfig().GetServiceDetails(), serviceManager.Client()), nil
-}
-
 func appendDistinctIfNeeded(disabledDistinctiveAql bool) string {
 	if disabledDistinctiveAql {
 		return `.distinct(false)`
@@ -205,80 +109,6 @@ func runAql(ctx context.Context, sourceRtDetails *config.ServerDetails, query st
 	return result, errorutils.CheckError(err)
 }
 
-func createTargetAuth(targetRtDetails *config.ServerDetails, proxyKey string) api.TargetAuth {
-	targetAuth := api.TargetAuth{
-		TargetArtifactoryUrl: targetRtDetails.ArtifactoryUrl,
-		TargetToken:          targetRtDetails.AccessToken,
-		TargetProxyKey:       proxyKey,
-	}
-	if targetAuth.TargetToken == "" {
-		targetAuth.TargetUsername = targetRtDetails.User
-		targetAuth.TargetPassword = targetRtDetails.Password
-	}
-	return targetAuth
-}
-
-func handleFilesOfCompletedChunk(chunkFiles []api.FileUploadStatusResponse, errorsChannelMng *ErrorsChannelMng) (stopped bool) {
-	for _, file := range chunkFiles {
-		if file.Status == api.Fail || file.Status == api.SkippedLargeProps {
-			stopped = addErrorToChannel(errorsChannelMng, file)
-			if stopped {
-				return
-			}
-		}
-	}
-	return
-}
-
-// Uploads chunk when there is room in queue.
-// This is a blocking method.
-func uploadChunkWhenPossible(pcWrapper *producerConsumerWrapper, phaseBase *phaseBase, chunk api.UploadChunk, uploadTokensChan chan UploadedChunk, errorsChannelMng *ErrorsChannelMng) (stopped bool) {
-	for {
-		if ShouldStop(phaseBase, nil, errorsChannelMng) {
-			return true
-		}
-		// If increment done, this go routine can proceed to upload the chunk. Otherwise, sleep and try again.
-		isIncr := pcWrapper.incProcessedChunksWhenPossible()
-		if !isIncr {
-			time.Sleep(waitTimeBetweenChunkStatusSeconds * time.Second)
-			continue
-		}
-		err := uploadChunkAndAddToken(phaseBase.srcUpService, chunk, uploadTokensChan)
-		if err != nil {
-			// Chunk not uploaded due to error. Reduce processed chunks count and send all chunk content to error channel, so that the files could be uploaded on next run.
-			pcWrapper.decProcessedChunks()
-			// If the transfer is interrupted by the user, we shouldn't write it in the CSV file
-			if errors.Is(err, context.Canceled) {
-				return true
-			}
-			return sendAllChunkToErrorChannel(chunk, errorsChannelMng, err, phaseBase.stateManager)
-		}
-		return ShouldStop(phaseBase, nil, errorsChannelMng)
-	}
-}
-
-func sendAllChunkToErrorChannel(chunk api.UploadChunk, errorsChannelMng *ErrorsChannelMng, errReason error, stateManager *state.TransferStateManager) (stopped bool) {
-	var failures []api.FileUploadStatusResponse
-	for _, file := range chunk.UploadCandidates {
-		fileFailureResponse := api.FileUploadStatusResponse{
-			FileRepresentation: file,
-			Reason:             errReason.Error(),
-		}
-		// In case an error occurred while handling errors files - stop transferring.
-		stopped = addErrorToChannel(errorsChannelMng, fileFailureResponse)
-		if stopped {
-			return
-		}
-		failures = append(failures, fileFailureResponse)
-	}
-	err := setChunkCompletedInRepoSnapshot(stateManager, failures)
-	if err != nil {
-		// We are logging the error instead of returning it since the original error is already handled.
-		log.Error(err)
-	}
-	return
-}
-
 // If repo snapshot is tracked, mark all files of a chunk as completed in their directory's node and check if node completed (done handling the directory and child directories).
 func setChunkCompletedInRepoSnapshot(stateManager *state.TransferStateManager, chunkFiles []api.FileUploadStatusResponse) (err error) {
 	if !stateManager.IsRepoTransferSnapshotEnabled() {
@@ -306,31 +136,6 @@ func setChunkCompletedInRepoSnapshot(stateManager *state.TransferStateManager, c
 	return
 }
 
-// Sends an upload chunk to the source Artifactory instance, to be handled asynchronously by the data-transfer plugin.
-// An uuid token is returned in order to poll on it for status.
-// This function sends the token to the uploadTokensChan for the pollUploads function to read and poll on.
-func uploadChunkAndAddToken(sup *srcUserPluginService, chunk api.UploadChunk, uploadTokensChan chan UploadedChunk) error {
-	uploadResponse, err := sup.uploadChunk(chunk)
-	if err != nil {
-		return err
-	}
-
-	// Add chunk data for polling.
-	log.Debug("Chunk sent to node " + uploadResponse.NodeId + ". Adding chunk token '" + uploadResponse.UuidToken + "' to poll on for status.")
-	uploadTokensChan <- newUploadedChunkStruct(uploadResponse, chunk)
-	return nil
-}
-
-func newUploadedChunkStruct(uploadChunkResponse api.UploadChunkResponse, chunk api.UploadChunk) UploadedChunk {
-	return UploadedChunk{
-		UploadChunkResponse: uploadChunkResponse,
-		UploadedChunkData: UploadedChunkData{
-			ChunkFiles: chunk.UploadCandidates,
-			TimeSent:   time.Now(),
-		},
-	}
-}
-
 func GetChunkBuilderThreads() int {
 	return curChunkBuilderThreads
 }
@@ -342,7 +147,7 @@ func GetChunkUploaderThreads() int {
 // Periodically reads settings file and updates the number of threads.
 // Number of threads in the settings files is expected to change by running a separate command.
 // The new number of threads should be almost immediately (checked every waitTimeBetweenThreadsUpdateSeconds) reflected on
-// the CLI side (by updating the producer consumer if used and the local variable) and as a result reflected on the Artifactory User Plugin side.
+// the CLI side (by updating the producer consumer if used and the local variable).
 // This method also looks for '~/.jfrog/transfer/stop' file and interrupts the transfer if exists.
 func periodicallyUpdateThreadsAndStopStatus(pcWrapper *producerConsumerWrapper, doneChan chan bool, buildInfoRepo bool, stopSignal chan os.Signal) {
 	log.Debug("Initializing polling on the settings and stop files...")
@@ -384,6 +189,15 @@ func updateThreads(pcWrapper *producerConsumerWrapper, buildInfoRepo bool) error
 	return nil
 }
 
+func shouldStopPolling(doneChan chan bool) bool {
+	select {
+	case done := <-doneChan:
+		return done
+	default:
+	}
+	return false
+}
+
 // Interrupt the transfer by populating the stopSignal channel with the Interrupt signal if the '~/.jfrog/transfer/stop' file exists.
 func interruptIfRequested(stopSignal chan os.Signal) error {
 	transferDir, err := coreutils.GetJfrogTransferDir()
@@ -409,32 +223,52 @@ func updateProducerConsumerMaxParallel(producerConsumer parallel.Runner, calcula
 	}
 }
 
-func uploadChunkWhenPossibleHandler(pcWrapper *producerConsumerWrapper, phaseBase *phaseBase, chunk api.UploadChunk,
-	uploadTokensChan chan UploadedChunk, errorsChannelMng *ErrorsChannelMng) parallel.TaskFunc {
+func transferFileHandler(phaseBase *phaseBase, file api.FileRepresentation, errorsChannelMng *ErrorsChannelMng) parallel.TaskFunc {
 	return func(threadId int) error {
 		logMsgPrefix := clientUtils.GetLogMsgPrefix(threadId, false)
-		log.Debug(logMsgPrefix + "Handling chunk upload")
-		shouldStop := uploadChunkWhenPossible(pcWrapper, phaseBase, chunk, uploadTokensChan, errorsChannelMng)
-		if shouldStop {
-			// The specific error that triggered the stop is already in the errors channel
+		log.Debug(logMsgPrefix + "Handling file transfer")
+		if ShouldStop(phaseBase, nil, errorsChannelMng) {
 			return errorutils.CheckErrorf("%sstopped", logMsgPrefix)
 		}
-		return nil
+		result := phaseBase.fileTransfer.TransferFile(phaseBase.context, file)
+		return handleTransferFileResult(phaseBase, result, errorsChannelMng)
 	}
 }
 
-// Collects files in chunks of size uploadChunkSize and sends them to be uploaded whenever possible (the amount of chunks uploaded is limited by the number of threads).
-// An uuid token is returned after the chunk is sent and is being polled on for status.
-func uploadByChunks(files []api.FileRepresentation, uploadTokensChan chan UploadedChunk, base phaseBase, delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng, pcWrapper *producerConsumerWrapper) (shouldStop bool, err error) {
-	curUploadChunk := api.UploadChunk{
-		TargetAuth:                createTargetAuth(base.targetRtDetails, base.proxyKey),
-		CheckExistenceInFilestore: base.checkExistenceInFilestore,
-		SkipFileFiltering:         base.locallyGeneratedFilter.IsEnabled(),
-		MinCheckSumDeploySize:     base.minCheckSumDeploySize,
+func handleTransferFileResult(phaseBase *phaseBase, result TransferResult, errorsChannelMng *ErrorsChannelMng) error {
+	fileStatus := result.ToFileUploadStatus()
+	if result.Status == api.Fail || result.Status == api.SkippedLargeProps {
+		if addErrorToChannel(errorsChannelMng, fileStatus) {
+			return errorutils.CheckErrorf("stopped")
+		}
 	}
+	if result.Status == api.Fail {
+		if phaseBase.stateManager != nil {
+			if err := setChunkCompletedInRepoSnapshot(phaseBase.stateManager, []api.FileUploadStatusResponse{fileStatus}); err != nil {
+				log.Error(err)
+			}
+		}
+		return nil
+	}
+	if phaseBase.stateManager != nil {
+		chunk := api.ChunkStatus{Files: []api.FileUploadStatusResponse{fileStatus}}
+		if err := state.UpdateChunkInState(phaseBase.stateManager, &chunk); err != nil {
+			log.Error(err)
+		}
+		timeEstMng := &phaseBase.stateManager.TimeEstimationManager
+		if err := timeEstMng.AddChunkStatus(chunk, result.DurationMillis); err != nil {
+			log.Error(err)
+		}
+		if err := setChunkCompletedInRepoSnapshot(phaseBase.stateManager, chunk.Files); err != nil {
+			log.Error(err)
+		}
+	}
+	return nil
+}
 
+func transferFiles(files []api.FileRepresentation, base phaseBase, delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng, pcWrapper *producerConsumerWrapper) (shouldStop bool, err error) {
 	for _, item := range files {
-		file := api.FileRepresentation{Repo: item.Repo, Path: item.Path, Name: item.Name, Size: item.Size}
+		file := api.FileRepresentation{Repo: item.Repo, Path: item.Path, Name: item.Name, Size: item.Size, NonEmptyDir: item.NonEmptyDir}
 		var delayed bool
 		delayed, shouldStop = delayHelper.delayUploadIfNecessary(base, file)
 		if shouldStop {
@@ -443,19 +277,7 @@ func uploadByChunks(files []api.FileRepresentation, uploadTokensChan chan Upload
 		if delayed {
 			continue
 		}
-		curUploadChunk.AppendUploadCandidateIfNeeded(file, base.buildInfoRepo)
-		if curUploadChunk.IsChunkFull() {
-			_, err = pcWrapper.chunkUploaderProducerConsumer.AddTaskWithError(uploadChunkWhenPossibleHandler(pcWrapper, &base, curUploadChunk, uploadTokensChan, errorsChannelMng), pcWrapper.errorsQueue.AddError)
-			if err != nil {
-				return
-			}
-			// Empty the uploaded chunk.
-			curUploadChunk.UploadCandidates = []api.FileRepresentation{}
-		}
-	}
-	// Chunk didn't reach full size. Upload the remaining files.
-	if len(curUploadChunk.UploadCandidates) > 0 {
-		_, err = pcWrapper.chunkUploaderProducerConsumer.AddTaskWithError(uploadChunkWhenPossibleHandler(pcWrapper, &base, curUploadChunk, uploadTokensChan, errorsChannelMng), pcWrapper.errorsQueue.AddError)
+		_, err = pcWrapper.chunkUploaderProducerConsumer.AddTaskWithError(transferFileHandler(&base, file, errorsChannelMng), pcWrapper.errorsQueue.AddError)
 		if err != nil {
 			return
 		}
@@ -491,36 +313,6 @@ func ShouldStop(phase *phaseBase, delayHelper *delayUploadHelper, errorsChannelM
 		return true
 	}
 	return false
-}
-
-func getRunningNodes(ctx context.Context, sourceRtDetails *config.ServerDetails) ([]string, error) {
-	serviceManager, err := createTransferServiceManager(ctx, sourceRtDetails)
-	if err != nil {
-		return nil, err
-	}
-	return serviceManager.GetRunningNodes()
-}
-
-func stopTransferInArtifactoryNodes(srcUpService *srcUserPluginService, runningNodes []string) {
-	remainingNodesToStop := make(map[string]string)
-	for _, s := range runningNodes {
-		remainingNodesToStop[s] = s
-	}
-	log.Debug("Running Artifactory nodes to stop transfer on:", remainingNodesToStop)
-	// Send a stop command up to 5 times the number of Artifactory nodes, to make sure we reach out to all nodes
-	for i := 0; i < len(runningNodes)*5; i++ {
-		if len(remainingNodesToStop) == 0 {
-			log.Debug("Transfer on all Artifactory nodes stopped successfully")
-			return
-		}
-		nodeId, err := srcUpService.stop()
-		if err != nil {
-			log.Error(err)
-		} else {
-			log.Debug("Node " + nodeId + " stopped")
-			delete(remainingNodesToStop, nodeId)
-		}
-	}
 }
 
 // getMaxUniqueSnapshots gets the local repository's setting of max unique snapshots (Maven, Gradle, NuGet, Ivy and SBT)
@@ -680,17 +472,6 @@ func updateMaxDockerUniqueSnapshots(serviceManager artifactory.ArtifactoryServic
 	repoParams.Key = repoSummary.RepoKey
 	repoParams.MaxUniqueTags = &newMaxUniqueSnapshots
 	return serviceManager.UpdateLocalRepository().Docker(repoParams)
-}
-
-func stopTransferInArtifactory(serverDetails *config.ServerDetails, srcUpService *srcUserPluginService) error {
-	// To avoid situations where context has already been canceled, we use a new context here instead of the old context of the transfer phase.
-	runningNodes, err := getRunningNodes(context.Background(), serverDetails)
-	if err != nil {
-		return err
-	} else {
-		stopTransferInArtifactoryNodes(srcUpService, runningNodes)
-	}
-	return nil
 }
 
 func getJfrogTransferRepoDelaysDir(repoKey string) (string, error) {

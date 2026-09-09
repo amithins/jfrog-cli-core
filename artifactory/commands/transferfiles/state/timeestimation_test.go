@@ -232,6 +232,21 @@ func TestTransferredSizeInState(t *testing.T) {
 	assertTransferredSizes(t, timeEstMng.stateManager, chunkStatus1.Files[0].SizeBytes+chunkStatus1.Files[1].SizeBytes, chunkStatus3.Files[0].SizeBytes+chunkStatus4.Files[0].SizeBytes)
 }
 
+func TestAddChunkStatus_zeroDurationChecksumHitCountsBytes(t *testing.T) {
+	timeEstMng, cleanUp := initTimeEstimationDataTest(t)
+	defer cleanUp()
+
+	const fileSize = int64(8 * rtServicesUtils.SizeMiB)
+	chunkStatus := api.ChunkStatus{
+		Files: []api.FileUploadStatusResponse{
+			createFileUploadStatusResponse(repo1Key, fileSize, true, api.Success),
+		},
+	}
+	assert.NoError(t, timeEstMng.AddChunkStatus(chunkStatus, 0))
+	assert.Equal(t, uint64(fileSize), timeEstMng.CurrentTotalTransferredBytes)
+	assert.Empty(t, timeEstMng.LastSpeeds)
+}
+
 func addChunkStatus(t *testing.T, timeEstMng *TimeEstimationManager, chunkStatus api.ChunkStatus, workingThreads int, includedInTotalSize bool, durationMillis int64) {
 	if includedInTotalSize {
 		err := UpdateChunkInState(timeEstMng.stateManager, &chunkStatus)

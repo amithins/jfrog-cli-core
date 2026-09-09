@@ -3,19 +3,122 @@ package transferfiles
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/state"
+	commandsUtils "github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/utils"
 	commonTests "github.com/jfrog/jfrog-cli-core/v2/common/tests"
+	coreConfig "github.com/jfrog/jfrog-cli-core/v2/utils/config"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/tests"
 	servicesUtils "github.com/jfrog/jfrog-client-go/artifactory/services/utils"
 	"github.com/jfrog/jfrog-client-go/utils/log"
 	"github.com/stretchr/testify/assert"
 )
+
+type fakeFileTransferExecutor struct {
+	callCount int
+	mu        sync.Mutex
+}
+
+func (f *fakeFileTransferExecutor) TransferFile(_ context.Context, candidate api.FileRepresentation) TransferResult {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callCount++
+	if candidate.Name == "fail.jar" {
+		return TransferResult{
+			Candidate: candidate,
+			Status:    api.Fail,
+			Err:       errors.New("transfer failed"),
+		}
+	}
+	return TransferResult{Candidate: candidate, Status: api.Success}
+}
+
+type folderEnqueueCounter struct {
+	count int
+	mu    sync.Mutex
+}
+
+func (c *folderEnqueueCounter) TransferFile(_ context.Context, candidate api.FileRepresentation) TransferResult {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if candidate.Name == "" {
+		c.count++
+	}
+	return TransferResult{Candidate: candidate, Status: api.Success}
+}
+
+func (c *folderEnqueueCounter) folderEnqueueCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.count
+}
+
+func TestFolderTraversal_schedulesFileTransferNotUploadChunk(t *testing.T) {
+	stateManager, cleanUp := state.InitStateTest(t)
+	defer cleanUp()
+
+	uploadChunkCalls := 0
+	mockAqlResults := servicesUtils.AqlSearchResult{
+		Results: []servicesUtils.ResultItem{
+			{Repo: "test-repo", Path: ".", Name: "file.jar", Size: 100, Type: "file"},
+		},
+	}
+
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.RequestURI {
+		case "/api/search/aql":
+			w.WriteHeader(http.StatusOK)
+			response, _ := json.Marshal(mockAqlResults)
+			_, _ = w.Write(response)
+		case "/" + commandsUtils.PluginsExecuteRestApi + "uploadChunk":
+			uploadChunkCalls++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"uuid_token":"token"}`))
+		}
+	}))
+	defer testServer.Close()
+
+	serverDetails := &coreConfig.ServerDetails{ArtifactoryUrl: testServer.URL + "/"}
+
+	assert.NoError(t, stateManager.SetRepoState("test-repo", 0, 0, false, true))
+	node, err := stateManager.LookUpNode(".")
+	assert.NoError(t, err)
+
+	executor := &fakeFileTransferExecutor{}
+	pcWrapper := newProducerConsumerWrapper()
+	errorsChannelMng := createErrorsChannelMng()
+
+	phase := &fullTransferPhase{
+		phaseBase: phaseBase{
+			context:                context.Background(),
+			stateManager:           stateManager,
+			repoKey:                "test-repo",
+			srcRtDetails:           serverDetails,
+			fileTransfer:           executor,
+			pcDetails:              &pcWrapper,
+			locallyGeneratedFilter: &locallyGeneratedFilter{enabled: false},
+		},
+	}
+
+	delayedArtifactsChannelMng := createdDelayedArtifactsChannelMng()
+	delayHelper := delayUploadHelper{delayedArtifactsChannelMng: &delayedArtifactsChannelMng}
+
+	err = phase.transferFolder(node, folderParams{relativePath: "."}, "", &pcWrapper, delayHelper, &errorsChannelMng)
+	assert.NoError(t, err)
+
+	assert.NoError(t, runProducerConsumers(&pcWrapper))
+
+	assert.Equal(t, 1, executor.callCount, "folder traversal should schedule FileTransfer.TransferFile per file")
+	assert.Zero(t, uploadChunkCalls, "folder traversal should not schedule uploadChunk handler")
+}
 
 // TestGetPatternMatchingFilesWithResults tests getPatternMatchingFiles with files returned
 func TestGetPatternMatchingFilesWithResults(t *testing.T) {

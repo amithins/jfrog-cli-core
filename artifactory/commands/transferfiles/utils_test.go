@@ -12,10 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
-	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/state"
 	artifactoryutils "github.com/jfrog/jfrog-cli-core/v2/artifactory/utils"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/config"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/tests"
@@ -28,26 +26,6 @@ import (
 )
 
 type transferFilesHandler func(w http.ResponseWriter, r *http.Request)
-
-const runningNodesResponse = `
-{
-	"isHa": true,
-	"nodes": [
-	  {
-		"id": "node-1",
-		"state": "RUNNING"
-	  },
-	  {
-		"id": "node-2",
-		"state": "RUNNING"
-	  },
-	  {
-		"id": "node-3",
-		"state": "RUNNING"
-	  }
-	]
-  }
-`
 
 const (
 	staleChunksNodeIdOne = "node-id-1"
@@ -73,43 +51,6 @@ func TestInitTempDir(t *testing.T) {
 	// Unset temp dir and assert that it is not contain transfer/tmp
 	unsetTempDir()
 	assert.NotContains(t, fileutils.GetTempDirBase(), filepath.Join("transfer", "tmp"))
-}
-
-func TestGetRunningNodes(t *testing.T) {
-	testServer, serverDetails, _ := createMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, err := w.Write([]byte(runningNodesResponse))
-		assert.NoError(t, err)
-	})
-	defer testServer.Close()
-
-	runningNodes, err := getRunningNodes(context.Background(), serverDetails)
-	assert.NoError(t, err)
-	assert.ElementsMatch(t, runningNodes, []string{"node-1", "node-2", "node-3"})
-}
-
-func TestStopTransferOnArtifactoryNodes(t *testing.T) {
-	stoppedNodeOne, stoppedNodeTwo := false, false
-	requestNumber := 0
-	testServer, _, srcUpService := createMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		var nodeId string
-		if requestNumber == 0 {
-			nodeId = "node-1"
-			stoppedNodeOne = true
-		} else {
-			nodeId = "node-2"
-			stoppedNodeTwo = true
-		}
-		_, err := fmt.Fprintf(w, `{"node_id": "%s"}`, nodeId)
-		assert.NoError(t, err)
-		requestNumber++
-	})
-	defer testServer.Close()
-
-	stopTransferInArtifactoryNodes(srcUpService, []string{"node-1", "node-2"})
-	assert.True(t, stoppedNodeOne)
-	assert.True(t, stoppedNodeTwo)
 }
 
 const repoConfigurationResponse = `
@@ -174,7 +115,7 @@ func TestGetMaxUniqueSnapshots(t *testing.T) {
 		{docker, 3},
 	}
 
-	testServer, serverDetails, _ := createMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+	testServer, serverDetails := createMockServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		packageType := strings.TrimSuffix(strings.TrimPrefix(r.RequestURI, "/api/repositories/"), "-local")
 		var response string
@@ -205,7 +146,7 @@ func TestGetMaxUniqueSnapshots(t *testing.T) {
 func TestUpdateMaxUniqueSnapshots(t *testing.T) {
 	packageTypes := []string{conan, maven, gradle, nuget, ivy, sbt, docker}
 
-	testServer, serverDetails, _ := createMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+	testServer, serverDetails := createMockServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		body, err := io.ReadAll(r.Body)
 		assert.NoError(t, err)
@@ -279,139 +220,10 @@ func TestInterruptIfRequested(t *testing.T) {
 	assert.Equal(t, os.Interrupt, actualSignal)
 }
 
-func TestGetNodeIdToChunkIdsMap(t *testing.T) {
-	// Test empty ChunksLifeCycleManager
-	chunksLifeCycleManager := ChunksLifeCycleManager{}
-	assert.Empty(t, chunksLifeCycleManager.GetNodeIdToChunkIdsMap())
-
-	// Create ChunksLifeCycleManager with 3 nodes
-	chunksLifeCycleManager = ChunksLifeCycleManager{
-		nodeToChunksMap: make(map[api.NodeId]map[api.ChunkId]UploadedChunkData),
-	}
-	chunksLifeCycleManager.nodeToChunksMap["nodeId-1"] = map[api.ChunkId]UploadedChunkData{"0": {}, "1": {}}
-	chunksLifeCycleManager.nodeToChunksMap["nodeId-2"] = map[api.ChunkId]UploadedChunkData{"2": {}}
-	chunksLifeCycleManager.nodeToChunksMap["nodeId-3"] = map[api.ChunkId]UploadedChunkData{}
-
-	// Generate the map and check response
-	nodeIdToChunkIdsMap := chunksLifeCycleManager.GetNodeIdToChunkIdsMap()
-	assert.ElementsMatch(t, nodeIdToChunkIdsMap["nodeId-1"], []api.ChunkId{"0", "1"})
-	assert.ElementsMatch(t, nodeIdToChunkIdsMap["nodeId-2"], []api.ChunkId{"2"})
-	assert.ElementsMatch(t, nodeIdToChunkIdsMap["nodeId-3"], []api.ChunkId{})
-}
-
-func TestStoreStaleChunksEmpty(t *testing.T) {
-	// Init state manager
-	stateManager, cleanUp := state.InitStateTest(t)
-	defer cleanUp()
-
-	// Store empty stale chunks
-	chunksLifeCycleManager := ChunksLifeCycleManager{
-		nodeToChunksMap: make(map[api.NodeId]map[api.ChunkId]UploadedChunkData),
-	}
-	assert.NoError(t, chunksLifeCycleManager.StoreStaleChunks(stateManager))
-
-	// Make sure no chunks
-	staleChunks, err := stateManager.GetStaleChunks()
-	assert.NoError(t, err)
-	assert.Empty(t, staleChunks)
-}
-
-func TestStoreStaleChunksNoStale(t *testing.T) {
-	// Init state manager
-	stateManager, cleanUp := state.InitStateTest(t)
-	defer cleanUp()
-
-	// Store chunk that is not stale
-	chunksLifeCycleManager := ChunksLifeCycleManager{
-		nodeToChunksMap: map[api.NodeId]map[api.ChunkId]UploadedChunkData{
-			staleChunksNodeIdOne: {
-				staleChunksChunkId: {
-					TimeSent:   time.Now().Add(-time.Minute),
-					ChunkFiles: []api.FileRepresentation{{Repo: repo1Key, Path: staleChunksPath, Name: staleChunksName}},
-				},
-			},
-		},
-	}
-	assert.NoError(t, chunksLifeCycleManager.StoreStaleChunks(stateManager))
-
-	// Make sure no chunks
-	staleChunks, err := stateManager.GetStaleChunks()
-	assert.NoError(t, err)
-	assert.Empty(t, staleChunks)
-}
-
-func TestStoreStaleChunksStale(t *testing.T) {
-	// Init state manager
-	stateManager, cleanUp := state.InitStateTest(t)
-	defer cleanUp()
-
-	// Store stale chunk
-	sent := time.Now().Add(-time.Hour)
-	chunksLifeCycleManager := ChunksLifeCycleManager{
-		nodeToChunksMap: map[api.NodeId]map[api.ChunkId]UploadedChunkData{
-			staleChunksNodeIdOne: {
-				staleChunksChunkId: {
-					TimeSent:   sent,
-					ChunkFiles: []api.FileRepresentation{{Repo: repo1Key, Path: staleChunksPath, Name: staleChunksName, Size: 100}},
-				},
-			},
-		},
-	}
-	assert.NoError(t, chunksLifeCycleManager.StoreStaleChunks(stateManager))
-
-	// Make sure the stale chunk was stored in the state
-	staleChunks, err := stateManager.GetStaleChunks()
-	assert.NoError(t, err)
-	assert.Len(t, staleChunks, 1)
-	assert.Equal(t, staleChunksNodeIdOne, staleChunks[0].NodeID)
-	assert.Len(t, staleChunks[0].Chunks, 1)
-	assert.Equal(t, staleChunksChunkId, staleChunks[0].Chunks[0].ChunkID)
-	assert.Equal(t, sent.Unix(), staleChunks[0].Chunks[0].Sent)
-	assert.Len(t, staleChunks[0].Chunks[0].Files, 1)
-	assert.Equal(t, fmt.Sprintf("%s/%s/%s (0.1KB)", repo1Key, staleChunksPath, staleChunksName), staleChunks[0].Chunks[0].Files[0])
-}
-
-func TestStoreStaleChunksTwoNodes(t *testing.T) {
-	// Init state manager
-	stateManager, cleanUp := state.InitStateTest(t)
-	defer cleanUp()
-
-	// Store 1 stale chunk and 1 non-stale chunk
-	chunksLifeCycleManager := ChunksLifeCycleManager{
-		nodeToChunksMap: map[api.NodeId]map[api.ChunkId]UploadedChunkData{
-			staleChunksNodeIdOne: {
-				staleChunksChunkId: {
-					TimeSent:   time.Now().Add(-time.Hour), // Older than 0.5 hours
-					ChunkFiles: []api.FileRepresentation{{Repo: repo1Key, Path: staleChunksPath, Name: staleChunksName, Size: 1024}},
-				},
-			},
-			staleChunksNodeIdTwo: {
-				staleChunksChunkId: {
-					TimeSent:   time.Now(), // Less than 0.5 hours
-					ChunkFiles: []api.FileRepresentation{{Repo: repo2Key, Path: staleChunksPath, Name: staleChunksName, Size: 0}},
-				},
-			},
-		},
-	}
-	assert.NoError(t, chunksLifeCycleManager.StoreStaleChunks(stateManager))
-
-	// Make sure only the stale chunk was stored in the state
-	staleChunks, err := stateManager.GetStaleChunks()
-	assert.NoError(t, err)
-	assert.Len(t, staleChunks, 1)
-	assert.Equal(t, staleChunksNodeIdOne, staleChunks[0].NodeID)
-}
-
-// Create mock server to test transfer config commands
-// t           - The testing object
-// testHandler - The HTTP handler of the test
-func createMockServer(t *testing.T, testHandler transferFilesHandler) (*httptest.Server, *config.ServerDetails, *srcUserPluginService) {
+func createMockServer(t *testing.T, testHandler transferFilesHandler) (*httptest.Server, *config.ServerDetails) {
 	testServer := httptest.NewServer(http.HandlerFunc(testHandler))
 	serverDetails := &config.ServerDetails{ArtifactoryUrl: testServer.URL + "/"}
-
-	serviceManager, err := createSrcRtUserPluginServiceManager(context.Background(), serverDetails)
-	assert.NoError(t, err)
-	return testServer, serverDetails, serviceManager
+	return testServer, serverDetails
 }
 
 func TestGetUniqueErrorOrDelayFilePath(t *testing.T) {

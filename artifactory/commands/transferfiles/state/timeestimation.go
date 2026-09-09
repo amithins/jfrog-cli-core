@@ -42,27 +42,41 @@ type TimeEstimationManager struct {
 }
 
 func (tem *TimeEstimationManager) AddChunkStatus(chunkStatus api.ChunkStatus, durationMillis int64) error {
+	if err := tem.addTransferredBytesFromChunk(chunkStatus); err != nil {
+		return err
+	}
 	if durationMillis == 0 {
 		return nil
 	}
-
-	return tem.addDataChunkStatus(chunkStatus, durationMillis)
+	return tem.addSpeedSampleFromChunk(chunkStatus, durationMillis)
 }
 
-func (tem *TimeEstimationManager) addDataChunkStatus(chunkStatus api.ChunkStatus, durationMillis int64) error {
+func (tem *TimeEstimationManager) addTransferredBytesFromChunk(chunkStatus api.ChunkStatus) error {
+	for _, file := range chunkStatus.Files {
+		if file.Status == api.Fail {
+			continue
+		}
+		unsignedSizeBytes, err := safeconvert.Int64ToUint64(file.SizeBytes)
+		if err != nil {
+			return fmt.Errorf("failed to calculate the estimated remaining time: %w", err)
+		}
+		tem.CurrentTotalTransferredBytes += unsignedSizeBytes
+	}
+	return nil
+}
+
+func chunkSizeBytesForSpeed(chunkStatus api.ChunkStatus) int64 {
 	var chunkSizeBytes int64
 	for _, file := range chunkStatus.Files {
-		if file.Status != api.Fail {
-			unsignedSizeBytes, err := safeconvert.Int64ToUint64(file.SizeBytes)
-			if err != nil {
-				return fmt.Errorf("failed to calculate the estimated remaining time: %w", err)
-			}
-			tem.CurrentTotalTransferredBytes += unsignedSizeBytes
-		}
 		if (file.Status == api.Success || file.Status == api.SkippedLargeProps) && !file.ChecksumDeployed {
 			chunkSizeBytes += file.SizeBytes
 		}
 	}
+	return chunkSizeBytes
+}
+
+func (tem *TimeEstimationManager) addSpeedSampleFromChunk(chunkStatus api.ChunkStatus, durationMillis int64) error {
+	chunkSizeBytes := chunkSizeBytesForSpeed(chunkStatus)
 
 	// If no files were uploaded regularly (with no errors and not checksum-deployed), don't use this chunk for the time estimation calculation.
 	if chunkSizeBytes == 0 {

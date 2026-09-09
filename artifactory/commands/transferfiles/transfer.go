@@ -9,13 +9,10 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jfrog/gofrog/safeconvert"
-	"github.com/jfrog/jfrog-client-go/artifactory/services"
-
 	"github.com/jfrog/gofrog/version"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/state"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/utils/precheckrunner"
@@ -23,9 +20,9 @@ import (
 	"github.com/jfrog/jfrog-cli-core/v2/utils/config"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/coreutils"
 	usageReporter "github.com/jfrog/jfrog-cli-core/v2/utils/usage"
+	"github.com/jfrog/jfrog-client-go/artifactory/services"
 	serviceUtils "github.com/jfrog/jfrog-client-go/artifactory/services/utils"
 	"github.com/jfrog/jfrog-client-go/artifactory/usage"
-	clientutils "github.com/jfrog/jfrog-client-go/utils"
 	"github.com/jfrog/jfrog-client-go/utils/errorutils"
 	"github.com/jfrog/jfrog-client-go/utils/io/fileutils"
 	"github.com/jfrog/jfrog-client-go/utils/log"
@@ -37,7 +34,6 @@ const (
 	fileWritersChannelSize       = 500000
 	retries                      = 600
 	retriesWaitMilliSecs         = 5000
-	dataTransferPluginMinVersion = "1.7.0"
 	disableDistinctAqlMinVersion = "7.37"
 	// Exact UTC-millisecond timestamp expected by --created-after / --downloaded-after.
 	timestampFilterLayout = "2006-01-02T15:04:05.000Z"
@@ -81,6 +77,9 @@ type TransferFilesCommand struct {
 	locallyGeneratedFilter    *locallyGeneratedFilter
 	// Optimization in Artifactory version 7.37 and above enables the exclusion of setting DISTINCT in SQL queries
 	disabledDistinctiveAql bool
+	sourceClient           *SourceClient
+	targetClient           *TargetClient
+	fileTransfer           *FileTransfer
 }
 
 func NewTransferFilesCommand(sourceServer, targetServer *config.ServerDetails) (*TransferFilesCommand, error) {
@@ -215,6 +214,9 @@ func (tdc *TransferFilesCommand) Run() (err error) {
 	if tdc.stop {
 		return tdc.signalStop()
 	}
+	if tdc.proxyKey != "" {
+		return errorutils.CheckErrorf("--proxy-key is not supported on the public GET/PUT transfer path; configure an HTTP proxy on the CLI host instead")
+	}
 	if tdc.timestampFilter, err = tdc.resolveTimestampFilter(); err != nil {
 		return err
 	}
@@ -228,18 +230,21 @@ func (tdc *TransferFilesCommand) Run() (err error) {
 		return err
 	}
 
-	srcUpService, err := createSrcRtUserPluginServiceManager(tdc.context, tdc.sourceServerDetails)
+	tdc.sourceClient, err = NewSourceClient(tdc.context, tdc.sourceServerDetails)
 	if err != nil {
 		return err
 	}
-
-	if err = getAndValidateDataTransferPlugin(srcUpService); err != nil {
+	tdc.targetClient, err = NewTargetClient(tdc.context, tdc.targetServerDetails)
+	if err != nil {
 		return err
 	}
+	tdc.fileTransfer = NewFileTransfer(tdc.sourceClient, tdc.targetClient, FileTransferOptions{})
 
-	if err = tdc.verifySourceTargetConnectivity(srcUpService); err != nil {
+	log.Info("Verifying source to target Artifactory servers connectivity...")
+	if err = tdc.targetClient.Ping(tdc.context); err != nil {
 		return err
 	}
+	log.Info("Connectivity check passed!")
 
 	if err = tdc.initDistinctAql(); err != nil {
 		return err
@@ -280,7 +285,7 @@ func (tdc *TransferFilesCommand) Run() (err error) {
 	}
 
 	// Handle interruptions
-	finishStopping, newPhase := tdc.handleStop(srcUpService)
+	finishStopping, newPhase := tdc.handleStop()
 	defer finishStopping()
 
 	if err = tdc.removeOldFilesIfNeeded(allSourceLocalRepos); err != nil {
@@ -306,12 +311,12 @@ func (tdc *TransferFilesCommand) Run() (err error) {
 	go tdc.reportTransferFilesUsage()
 
 	// Transfer local repositories
-	if err := tdc.transferRepos(sourceLocalRepos, targetLocalRepos, false, newPhase, srcUpService); err != nil {
+	if err := tdc.transferRepos(sourceLocalRepos, targetLocalRepos, false, newPhase); err != nil {
 		return tdc.cleanup(err, sourceLocalRepos)
 	}
 
 	// Transfer build-info repositories
-	if err := tdc.transferRepos(sourceBuildInfoRepos, targetBuildInfoRepos, true, newPhase, srcUpService); err != nil {
+	if err := tdc.transferRepos(sourceBuildInfoRepos, targetBuildInfoRepos, true, newPhase); err != nil {
 		return tdc.cleanup(err, allSourceLocalRepos)
 	}
 
@@ -457,12 +462,12 @@ func (tdc *TransferFilesCommand) NewTransferDataPreChecksRunner() (runner *prech
 }
 
 func (tdc *TransferFilesCommand) transferRepos(sourceRepos []string, targetRepos []string,
-	buildInfoRepo bool, newPhase *transferPhase, srcUpService *srcUserPluginService) error {
+	buildInfoRepo bool, newPhase *transferPhase) error {
 	for _, repoKey := range sourceRepos {
 		if tdc.shouldStop() {
 			return nil
 		}
-		err := tdc.transferSingleRepo(repoKey, targetRepos, buildInfoRepo, newPhase, srcUpService)
+		err := tdc.transferSingleRepo(repoKey, targetRepos, buildInfoRepo, newPhase)
 		if err != nil {
 			return err
 		}
@@ -471,7 +476,7 @@ func (tdc *TransferFilesCommand) transferRepos(sourceRepos []string, targetRepos
 }
 
 func (tdc *TransferFilesCommand) transferSingleRepo(sourceRepoKey string, targetRepos []string,
-	buildInfoRepo bool, newPhase *transferPhase, srcUpService *srcUserPluginService) (err error) {
+	buildInfoRepo bool, newPhase *transferPhase) (err error) {
 	if !slices.Contains(targetRepos, sourceRepoKey) {
 		log.Error("repository '" + sourceRepoKey + "' does not exist in target. Skipping...")
 		return
@@ -512,17 +517,11 @@ func (tdc *TransferFilesCommand) transferSingleRepo(sourceRepoKey string, target
 		if tdc.shouldStop() {
 			return
 		}
-		// Ensure the data structure which stores the upload tasks on Artifactory's side is wiped clean,
-		// in case some requests to delete handles tasks sent by JFrog CLI did not reach Artifactory.
-		err = stopTransferInArtifactory(tdc.sourceServerDetails, srcUpService)
-		if err != nil {
-			log.Error(err)
-		}
 		*newPhase = createTransferPhase(currentPhaseId)
 		if err = tdc.stateManager.SetRepoPhase(currentPhaseId); err != nil {
 			return
 		}
-		if err = tdc.startPhase(newPhase, sourceRepoKey, buildInfoRepo, *repoSummary, srcUpService, minChecksumDeploySize); err != nil {
+		if err = tdc.startPhase(newPhase, sourceRepoKey, buildInfoRepo, *repoSummary, minChecksumDeploySize); err != nil {
 			return
 		}
 	}
@@ -588,8 +587,8 @@ func (tdc *TransferFilesCommand) removeOldFilesIfNeeded(repos []string) error {
 	return nil
 }
 
-func (tdc *TransferFilesCommand) startPhase(newPhase *transferPhase, repo string, buildInfoRepo bool, repoSummary serviceUtils.RepositorySummary, srcUpService *srcUserPluginService, minChecksumDeploySize int64) error {
-	tdc.initNewPhase(*newPhase, srcUpService, repoSummary, repo, buildInfoRepo, minChecksumDeploySize)
+func (tdc *TransferFilesCommand) startPhase(newPhase *transferPhase, repo string, buildInfoRepo bool, repoSummary serviceUtils.RepositorySummary, minChecksumDeploySize int64) error {
+	tdc.initNewPhase(*newPhase, repoSummary, repo, buildInfoRepo, minChecksumDeploySize)
 	skip, err := (*newPhase).shouldSkipPhase()
 	if err != nil || skip {
 		return err
@@ -629,8 +628,7 @@ func (tdc *TransferFilesCommand) startPhase(newPhase *transferPhase, repo string
 // Handle interrupted signal.
 // shouldStop - Pointer to boolean variable, if the process gets interrupted shouldStop will be set to true
 // newPhase - The current running phase
-// srcUpService - Source plugin service
-func (tdc *TransferFilesCommand) handleStop(srcUpService *srcUserPluginService) (func(), *transferPhase) {
+func (tdc *TransferFilesCommand) handleStop() (func(), *transferPhase) {
 	var newPhase transferPhase
 	finishStop := make(chan bool)
 	signal.Notify(tdc.stopSignal, os.Interrupt, syscall.SIGTERM)
@@ -650,10 +648,6 @@ func (tdc *TransferFilesCommand) handleStop(srcUpService *srcUserPluginService) 
 			newPhase.StopGracefully()
 		}
 		log.Info("Gracefully stopping files transfer...")
-		err := stopTransferInArtifactory(tdc.sourceServerDetails, srcUpService)
-		if err != nil {
-			log.Error(err)
-		}
 	}()
 
 	// Return a cleanup function that closes the stopSignal channel and wait for close if needed
@@ -667,16 +661,14 @@ func (tdc *TransferFilesCommand) handleStop(srcUpService *srcUserPluginService) 
 	}, &newPhase
 }
 
-func (tdc *TransferFilesCommand) initNewPhase(newPhase transferPhase, srcUpService *srcUserPluginService, repoSummary serviceUtils.RepositorySummary, repoKey string, buildInfoRepo bool, minChecksumDeploySize int64) {
+func (tdc *TransferFilesCommand) initNewPhase(newPhase transferPhase, repoSummary serviceUtils.RepositorySummary, repoKey string, buildInfoRepo bool, minChecksumDeploySize int64) {
 	newPhase.setContext(tdc.context)
 	newPhase.setRepoKey(repoKey)
 	newPhase.setCheckExistenceInFilestore(tdc.checkExistenceInFilestore)
 	newPhase.setSourceDetails(tdc.sourceServerDetails)
 	newPhase.setTargetDetails(tdc.targetServerDetails)
-	newPhase.setSrcUserPluginService(srcUpService)
 	newPhase.setRepoSummary(repoSummary)
 	newPhase.setProgressBar(tdc.progressbar)
-	newPhase.setProxyKey(tdc.proxyKey)
 	newPhase.setStateManager(tdc.stateManager)
 	newPhase.setBuildInfo(buildInfoRepo)
 	newPhase.setPackageType(repoSummary.PackageType)
@@ -685,6 +677,16 @@ func (tdc *TransferFilesCommand) initNewPhase(newPhase transferPhase, srcUpServi
 	newPhase.setMinCheckSumDeploySize(minChecksumDeploySize)
 	newPhase.setIncludeFilesPatterns(tdc.includeFilesPatterns)
 	newPhase.setTimestampFilter(tdc.timestampFilter)
+	tdc.fileTransfer.ConfigureOptions(FileTransferOptions{
+		TargetDeployOptions: TargetDeployOptions{
+			BuildInfoRepo:             buildInfoRepo,
+			MinChecksumDeploySize:     minChecksumDeploySize,
+			CheckExistenceInFilestore: tdc.checkExistenceInFilestore,
+			PackageType:               repoSummary.PackageType,
+		},
+		BuildInfoRepo: buildInfoRepo,
+	})
+	newPhase.setFileTransfer(tdc.fileTransfer)
 }
 
 // Get all local and build-info repositories of the input server
@@ -865,47 +867,6 @@ func (tdc *TransferFilesCommand) signalStop() error {
 
 func (tdc *TransferFilesCommand) shouldStop() bool {
 	return tdc.context.Err() != nil
-}
-
-func (tdc *TransferFilesCommand) verifySourceTargetConnectivity(srcUpService *srcUserPluginService) error {
-	log.Info("Verifying source to target Artifactory servers connectivity...")
-	targetAuth := createTargetAuth(tdc.targetServerDetails, tdc.proxyKey)
-	err := srcUpService.verifyConnectivityRequest(targetAuth)
-	if err == nil {
-		log.Info("Connectivity check passed!")
-	}
-	return err
-}
-
-func validateDataTransferPluginMinimumVersion(currentVersion string) error {
-	if strings.Contains(currentVersion, "SNAPSHOT") {
-		return nil
-	}
-	return clientutils.ValidateMinimumVersion(clientutils.DataTransfer, currentVersion, dataTransferPluginMinVersion)
-}
-
-// Verify connection to the source Artifactory instance, and that the user plugin is installed, responsive, and stands in the minimal version requirement.
-func getAndValidateDataTransferPlugin(srcUpService *srcUserPluginService) error {
-	verifyResponse, err := srcUpService.verifyCompatibilityRequest()
-	if err != nil {
-		errMsg := err.Error()
-		reason := ""
-		if strings.Contains(errMsg, "The execution name '") && strings.Contains(errMsg, "' could not be found") {
-			start := strings.Index(errMsg, "'")
-			missingApi := errMsg[start+1 : strings.Index(errMsg[start+1:], "'")+start+1]
-			reason = fmt.Sprintf(" This is because the '%s' API exposed by the plugin returns a '404 Not Found' response.", missingApi)
-		}
-		return errorutils.CheckErrorf("%s;\nIt looks like the 'data-transfer' user plugin isn't installed on the source instance."+
-			"%s Please refer to the documentation available at "+coreutils.JFrogHelpUrl+"jfrog-hosting-models-documentation/transfer-artifactory-configuration-and-files-to-jfrog-cloud for installation instructions",
-			errMsg, reason)
-	}
-
-	err = validateDataTransferPluginMinimumVersion(verifyResponse.Version)
-	if err != nil {
-		return err
-	}
-	log.Info("data-transfer plugin version: " + verifyResponse.Version)
-	return nil
 }
 
 // Loop on json files containing FilesErrors and collect them to one FilesErrors object.
