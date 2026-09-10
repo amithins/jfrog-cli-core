@@ -56,16 +56,16 @@ type SourceClient struct {
 	streamServiceManager   artifactory.ArtifactoryServicesManager
 }
 
-func createStreamingTransferServiceManager(ctx context.Context, serverDetails *config.ServerDetails) (artifactory.ArtifactoryServicesManager, error) {
-	return coreutils.CreateServiceManagerWithContext(ctx, serverDetails, false, 0, 0, 0, 0)
+func createStreamingTransferServiceManager(ctx context.Context, serverDetails *config.ServerDetails, httpClient *http.Client) (artifactory.ArtifactoryServicesManager, error) {
+	return coreutils.CreateServiceManagerWithContextAndHttpClient(ctx, serverDetails, false, 0, 0, 0, 0, httpClient)
 }
 
 func NewSourceClient(ctx context.Context, serverDetails *config.ServerDetails) (*SourceClient, error) {
-	metadataServiceManager, err := createTransferServiceManager(ctx, serverDetails)
+	metadataServiceManager, err := createTransferServiceManager(ctx, serverDetails, nil)
 	if err != nil {
 		return nil, err
 	}
-	streamServiceManager, err := createStreamingTransferServiceManager(ctx, serverDetails)
+	streamServiceManager, err := createStreamingTransferServiceManager(ctx, serverDetails, nil)
 	if err != nil {
 		return nil, err
 	}

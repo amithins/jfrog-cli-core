@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -73,8 +74,8 @@ func (m *InterruptionErr) Error() string {
 	return "Files transfer was interrupted by user"
 }
 
-func createTransferServiceManager(ctx context.Context, serverDetails *config.ServerDetails) (artifactory.ArtifactoryServicesManager, error) {
-	return utils.CreateServiceManagerWithContext(ctx, serverDetails, false, 0, retries, retriesWaitMilliSecs, time.Minute)
+func createTransferServiceManager(ctx context.Context, serverDetails *config.ServerDetails, httpClient *http.Client) (artifactory.ArtifactoryServicesManager, error) {
+	return utils.CreateServiceManagerWithContextAndHttpClient(ctx, serverDetails, false, 0, retries, retriesWaitMilliSecs, time.Minute, httpClient)
 }
 
 func appendDistinctIfNeeded(disabledDistinctiveAql bool) string {
@@ -85,7 +86,7 @@ func appendDistinctIfNeeded(disabledDistinctiveAql bool) string {
 }
 
 func runAql(ctx context.Context, sourceRtDetails *config.ServerDetails, query string) (result *serviceUtils.AqlSearchResult, err error) {
-	serviceManager, err := createTransferServiceManager(ctx, sourceRtDetails)
+	serviceManager, err := createTransferServiceManager(ctx, sourceRtDetails, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -320,7 +321,7 @@ func ShouldStop(phase *phaseBase, delayHelper *delayUploadHelper, errorsChannelM
 // For repositories of other package types or if an error is thrown, this function returns -1.
 func getMaxUniqueSnapshots(ctx context.Context, rtDetails *config.ServerDetails, repoSummary *serviceUtils.RepositorySummary) (maxUniqueSnapshots int, err error) {
 	maxUniqueSnapshots = -1
-	serviceManager, err := createTransferServiceManager(ctx, rtDetails)
+	serviceManager, err := createTransferServiceManager(ctx, rtDetails, nil)
 	if err != nil {
 		return
 	}
@@ -374,8 +375,8 @@ func getMaxUniqueSnapshots(ctx context.Context, rtDetails *config.ServerDetails,
 // updateMaxUniqueSnapshots updates the local repository's setting of max unique snapshots (Maven, Gradle, NuGet, Ivy and SBT)
 // or max unique tags (Docker).
 // For repositories of other package types, this function does nothing.
-func updateMaxUniqueSnapshots(ctx context.Context, rtDetails *config.ServerDetails, repoSummary *serviceUtils.RepositorySummary, newMaxUniqueSnapshots int) error {
-	serviceManager, err := createTransferServiceManager(ctx, rtDetails)
+func updateMaxUniqueSnapshots(ctx context.Context, rtDetails *config.ServerDetails, repoSummary *serviceUtils.RepositorySummary, newMaxUniqueSnapshots int, httpClient *http.Client) error {
+	serviceManager, err := createTransferServiceManager(ctx, rtDetails, httpClient)
 	if err != nil {
 		return err
 	}

@@ -78,14 +78,18 @@ func TestRunSetup_usesTargetPing_notPluginExecute(t *testing.T) {
 	assert.Equal(t, 0, pluginExecuteCalls, "command setup must not call /api/plugins/execute")
 }
 
-func TestRun_rejectsProxyKey(t *testing.T) {
+func TestRun_namedProxyKeyWithoutSourceFailsClearly(t *testing.T) {
 	cmd, err := NewTransferFilesCommand(nil, nil)
 	require.NoError(t, err)
 	cmd.SetProxyKey("source-to-target")
 
 	err = cmd.Run()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--proxy-key is not supported")
+	assert.Contains(t, err.Error(), `"source-to-target"`)
+	assert.Contains(t, err.Error(), "looked up on the source Artifactory")
+	assert.Contains(t, err.Error(), "source Artifactory is not configured")
+	assert.Contains(t, err.Error(), "http://proxy:3128")
+	assert.Contains(t, err.Error(), "HTTPS_PROXY")
 }
 
 func TestHandleStopInitAndClose(t *testing.T) {

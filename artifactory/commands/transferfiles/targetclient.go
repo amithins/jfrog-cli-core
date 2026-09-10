@@ -61,12 +61,12 @@ type TargetClient struct {
 	streamServiceManager   artifactory.ArtifactoryServicesManager
 }
 
-func NewTargetClient(ctx context.Context, serverDetails *config.ServerDetails) (*TargetClient, error) {
-	metadataServiceManager, err := createTransferServiceManager(ctx, serverDetails)
+func NewTargetClient(ctx context.Context, serverDetails *config.ServerDetails, proxyTransport http.RoundTripper) (*TargetClient, error) {
+	metadataServiceManager, err := createTransferServiceManager(ctx, serverDetails, httpClientWithTransport(proxyTransport, time.Minute))
 	if err != nil {
 		return nil, err
 	}
-	streamServiceManager, err := createStreamingTransferServiceManager(ctx, serverDetails)
+	streamServiceManager, err := createStreamingTransferServiceManager(ctx, serverDetails, httpClientWithTransport(proxyTransport, 0))
 	if err != nil {
 		return nil, err
 	}

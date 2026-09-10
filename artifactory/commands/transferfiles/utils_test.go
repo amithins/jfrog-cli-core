@@ -181,11 +181,11 @@ func TestUpdateMaxUniqueSnapshots(t *testing.T) {
 		t.Run(packageType, func(t *testing.T) {
 			lowerPackageType := strings.ToLower(packageType)
 			repoSummary := &utils.RepositorySummary{RepoKey: lowerPackageType + "-local", PackageType: packageType, RepoType: "LOCAL"}
-			err := updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5)
+			err := updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5, nil)
 			assert.NoError(t, err)
 
 			repoSummary = &utils.RepositorySummary{RepoKey: lowerPackageType + "-federated", PackageType: packageType, RepoType: "FEDERATED"}
-			err = updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5)
+			err = updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5, nil)
 			assert.NoError(t, err)
 		})
 	}

@@ -67,7 +67,7 @@ func TestTargetClient_Ping_usesSystemPing(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	err = client.Ping(context.Background())
@@ -95,7 +95,7 @@ func TestTargetClient_TryChecksumDeploy_hit_sendsNoBody(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	outcome, err := client.TryChecksumDeploy(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
@@ -115,7 +115,7 @@ func TestTargetClient_TryChecksumDeploy_missOn404(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	outcome, err := client.TryChecksumDeploy(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
@@ -130,7 +130,7 @@ func TestTargetClient_TryChecksumDeploy_conflictDoesNotFallThrough(t *testing.T)
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	outcome, err := client.TryChecksumDeploy(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
@@ -145,7 +145,7 @@ func TestTargetClient_TryChecksumDeploy_skipsBuildInfoRepo(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	options := defaultTargetDeployOptions()
@@ -169,7 +169,7 @@ func TestTargetClient_TryChecksumDeploy_filestoreOptionHeaders(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	options := defaultTargetDeployOptions()
@@ -201,7 +201,7 @@ func TestTargetClient_Put_setsContentLengthAndChecksumHeaders(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -221,7 +221,7 @@ func TestTargetClient_ApplyProperties_setsEligibleProperties(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	skippedLargeProps, err := client.ApplyProperties(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
@@ -245,7 +245,7 @@ func TestTargetClient_ApplyProperties_omitsValuesLongerThan2400(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	skippedLargeProps, err := client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
@@ -276,7 +276,7 @@ func TestTargetClient_ApplyProperties_usesPatchWhenEncodedPayloadExceeds4000(t *
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	skippedLargeProps, err := client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
@@ -307,7 +307,7 @@ func TestTargetClient_ApplyProperties_usesPutQueryWhenEncodedPayloadAtMost4000(t
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	_, err = client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
@@ -342,7 +342,7 @@ func TestTargetClient_ApplyProperties_stripsGeneratedPropertyKeys(t *testing.T) 
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	skippedLargeProps, err := client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
@@ -384,7 +384,7 @@ func TestTargetClient_CreateFolder_putsZeroByteBody(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	err = client.CreateFolder(context.Background(), folderMetadata, defaultTargetDeployOptions())
@@ -401,7 +401,7 @@ func TestTargetClient_noPluginExecuteURLs(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	require.NoError(t, client.Ping(context.Background()))
@@ -434,7 +434,7 @@ func TestTargetClient_checksumDeploy409DoesNotInvokePut(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	source := &mockTransferSource{
@@ -476,7 +476,7 @@ func TestNewTargetClient_streamServiceManagerHasNoOverallTimeoutOrRetries(t *tes
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	streamConfig := client.streamServiceManager.GetConfig()
@@ -495,7 +495,7 @@ func TestTargetClient_TryChecksumDeploy_skipsWhenSha1Empty(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -527,7 +527,7 @@ func TestTargetClient_emptySha1UsesPutStreamPath(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -553,7 +553,7 @@ func Test_addIdentityHeaders_convertsIsoTimestampsToEpochMilliseconds(t *testing
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	err = client.Put(context.Background(), testTargetMetadata(), strings.NewReader("hello world"), defaultTargetDeployOptions())
@@ -573,7 +573,7 @@ func Test_addIdentityHeaders_preservesNumericTimestamps(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -600,7 +600,7 @@ func Test_addIdentityHeaders_omitsInvalidTimestamps(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -632,7 +632,7 @@ func TestTargetClient_ApplyStatistics_putsItemStatisticsXML(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -659,7 +659,7 @@ func TestTargetClient_ApplyStatistics_rejectedStatus_doesNotFail(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -676,7 +676,7 @@ func TestTargetClient_ApplyStatistics_skipsWhenEmpty(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	err = client.ApplyStatistics(context.Background(), testTargetMetadata())
@@ -691,7 +691,7 @@ func TestTargetClient_ApplyStatistics_skipsFolders(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	err = client.ApplyStatistics(context.Background(), &SourceFileMetadata{
