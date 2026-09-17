@@ -159,6 +159,7 @@ func parseTimestampFilter(field timestampFilterField, value string) (*timestampF
 	return &timestampFilter{field: field, timestamp: value}, nil
 }
 
+// SetProxyKey stores the --proxy-key value. Target HTTP proxy consumers are restored in the proxy-key PR.
 func (tdc *TransferFilesCommand) SetProxyKey(proxyKey string) {
 	tdc.proxyKey = proxyKey
 }
@@ -241,6 +242,7 @@ func (tdc *TransferFilesCommand) Run() (err error) {
 	tdc.fileTransfer = NewFileTransfer(tdc.sourceClient, tdc.targetClient, FileTransferOptions{})
 
 	log.Info("Verifying target Artifactory server connectivity...")
+	// Source compatibility is no longer plugin-gated; initDistinctAql() only toggles AQL distinct for >=7.37.
 	if err = tdc.targetClient.Ping(tdc.context); err != nil {
 		return err
 	}

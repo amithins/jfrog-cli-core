@@ -350,20 +350,6 @@ func (ts *TransferStateManager) GetWorkingThreads() (int, error) {
 	return ts.WorkingThreads, nil
 }
 
-func (ts *TransferStateManager) SetStaleChunks(staleChunks []StaleChunks) error {
-	return ts.action(func(transferRunStatus *TransferRunStatus) error {
-		transferRunStatus.StaleChunks = staleChunks
-		return nil
-	})
-}
-
-func (ts *TransferStateManager) GetStaleChunks() (staleChunks []StaleChunks, err error) {
-	return staleChunks, ts.action(func(transferRunStatus *TransferRunStatus) error {
-		staleChunks = transferRunStatus.StaleChunks
-		return nil
-	})
-}
-
 func (ts *TransferStateManager) SaveStateAndSnapshots() error {
 	ts.TransferState.lastSaveTimestamp = time.Now()
 	if err := ts.persistTransferState(false); err != nil {

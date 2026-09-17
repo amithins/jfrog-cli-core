@@ -117,14 +117,7 @@ func TestCancelFuncCancelsInFlightTransferFile(t *testing.T) {
 }
 
 func TestHandleStopDumpsThreadsBeforeCancelingInFlightTransferFile(t *testing.T) {
-	testServer, serverDetails, srcUpService := createMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, err := w.Write([]byte(`{"isHa":false,"nodes":[]}`))
-		assert.NoError(t, err)
-	})
-	defer testServer.Close()
-
-	transferFilesCommand, err := NewTransferFilesCommand(serverDetails, nil)
+	transferFilesCommand, err := NewTransferFilesCommand(nil, nil)
 	require.NoError(t, err)
 	dumpStarted := make(chan struct{})
 	finishDump := make(chan struct{})
@@ -133,7 +126,7 @@ func TestHandleStopDumpsThreadsBeforeCancelingInFlightTransferFile(t *testing.T)
 		<-finishDump
 		return nil
 	}
-	finishStopping, _ := transferFilesCommand.handleStop(srcUpService)
+	finishStopping, _ := transferFilesCommand.handleStop()
 	defer finishStopping()
 
 	source := &cancelAwareTransferSource{started: make(chan struct{})}

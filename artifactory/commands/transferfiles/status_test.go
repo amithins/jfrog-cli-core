@@ -69,6 +69,8 @@ func TestShowStatus(t *testing.T) {
 	assert.Contains(t, results, "Transfer speed:		0.011 MB/s")
 	assert.Contains(t, results, "Estimated time remaining:	Not available yet")
 	assert.Contains(t, results, "Transfer failures:		223 (In Phase 3 and in subsequent executions, we'll retry transferring the failed files)")
+	assert.NotContains(t, results, "Stale chunks")
+	assert.NotContains(t, results, "stale_chunks")
 
 	// Check repository status
 	assert.Contains(t, results, "Current Repository Status")
