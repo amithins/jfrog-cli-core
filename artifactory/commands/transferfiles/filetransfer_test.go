@@ -289,7 +289,7 @@ func TestFileTransfer_contentGet404_releasesTargetEligibleCache(t *testing.T) {
 	}))
 	defer server.Close()
 
-	target, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	target, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testFileMetadata()
