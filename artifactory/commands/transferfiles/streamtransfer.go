@@ -41,7 +41,14 @@ func StreamGetToPut(ctx context.Context, expectedSize int64, source io.ReadClose
 		result.bytesCopied, result.err = copyWithExactSize(ctx, pw, source, expectedSize, buf)
 	}()
 
-	putErr := put(ctx, pr)
+	putErr := func() (err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				err = fmt.Errorf("panic in put: %v", recovered)
+			}
+		}()
+		return put(ctx, pr)
+	}()
 	closeReadCloser(pr)
 
 	sourceClosed := false

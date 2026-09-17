@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -58,6 +60,7 @@ type mockTransferTarget struct {
 	statsCalls      int
 	folderErr       error
 	folderCalls     int
+	releaseCalls    int
 }
 
 func (m *mockTransferTarget) TryChecksumDeploy(_ context.Context, _ *SourceFileMetadata, _ TargetDeployOptions) (ChecksumDeployOutcome, error) {
@@ -100,6 +103,10 @@ func (m *mockTransferTarget) ApplyProperties(_ context.Context, _ *SourceFileMet
 func (m *mockTransferTarget) ApplyStatistics(_ context.Context, _ *SourceFileMetadata) error {
 	m.statsCalls++
 	return m.statsErr
+}
+
+func (m *mockTransferTarget) ReleaseEligibleProperties(_ *SourceFileMetadata, _ TargetDeployOptions) {
+	m.releaseCalls++
 }
 
 func testFileCandidate() api.FileRepresentation {
@@ -229,6 +236,74 @@ func TestFileTransfer_contentGet404_isSkippedWithZeroSize(t *testing.T) {
 	assert.Zero(t, target.putCalls)
 }
 
+func TestFileTransfer_putFailure_releasesEligibleProperties(t *testing.T) {
+	putErr := errors.New("target put failed")
+	source := &mockTransferSource{
+		metadata: testFileMetadata(),
+		reader:   io.NopCloser(strings.NewReader("hello world")),
+	}
+	target := &mockTransferTarget{checksumOutcome: ChecksumDeployMiss, putErr: putErr, putFailAfter: 3}
+
+	ft := NewFileTransfer(source, target, FileTransferOptions{TargetDeployOptions: defaultTargetDeployOptions()})
+	result := ft.TransferFile(context.Background(), testFileCandidate())
+
+	require.ErrorIs(t, result.Err, putErr)
+	assert.Equal(t, api.Fail, result.Status)
+	assert.Zero(t, target.propsCalls)
+	assert.Equal(t, 1, target.releaseCalls)
+}
+
+func TestFileTransfer_checksumDeployError_releasesEligibleProperties(t *testing.T) {
+	checksumErr := errors.New("checksum deploy failed")
+	source := &mockTransferSource{metadata: testFileMetadata()}
+	target := &mockTransferTarget{checksumErr: checksumErr}
+
+	ft := NewFileTransfer(source, target, FileTransferOptions{TargetDeployOptions: defaultTargetDeployOptions()})
+	result := ft.TransferFile(context.Background(), testFileCandidate())
+
+	require.ErrorIs(t, result.Err, checksumErr)
+	assert.Equal(t, api.Fail, result.Status)
+	assert.Zero(t, source.getReaderCalls)
+	assert.Zero(t, target.propsCalls)
+	assert.Equal(t, 1, target.releaseCalls)
+}
+
+func TestFileTransfer_createFolderError_releasesEligibleProperties(t *testing.T) {
+	folderErr := errors.New("create folder failed")
+	source := &mockTransferSource{metadata: testFolderMetadata()}
+	target := &mockTransferTarget{folderErr: folderErr}
+
+	ft := NewFileTransfer(source, target, FileTransferOptions{TargetDeployOptions: defaultTargetDeployOptions()})
+	result := ft.TransferFile(context.Background(), testFolderCandidate(false))
+
+	require.ErrorIs(t, result.Err, folderErr)
+	assert.Equal(t, api.Fail, result.Status)
+	assert.Zero(t, target.propsCalls)
+	assert.Equal(t, 1, target.releaseCalls)
+}
+
+func TestFileTransfer_contentGet404_releasesTargetEligibleCache(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"not found"}]}`))
+	}))
+	defer server.Close()
+
+	target, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+
+	metadata := testFileMetadata()
+	source := &mockTransferSource{metadata: metadata, readerErr: ErrSourceItemGone}
+	options := defaultTargetDeployOptions()
+	ft := NewFileTransfer(source, target, FileTransferOptions{TargetDeployOptions: options})
+	result := ft.TransferFile(context.Background(), testFileCandidate())
+
+	require.NoError(t, result.Err)
+	assert.Equal(t, api.SkippedSourceItemGone, result.Status)
+	assert.False(t, eligibleCacheHas(target, metadata, options),
+		"TransferFile must release eligibleCache when content GET 404 skips ApplyProperties")
+}
+
 func TestFileTransfer_putFailure_isRetryable(t *testing.T) {
 	putErr := errors.New("target put failed")
 	source := &mockTransferSource{
@@ -246,7 +321,7 @@ func TestFileTransfer_putFailure_isRetryable(t *testing.T) {
 	assert.Empty(t, target.putContent)
 }
 
-func TestFileTransfer_putSuccess_propertiesFailure_reportsZeroBytes(t *testing.T) {
+func TestFileTransfer_putSuccess_propertiesFailure_keepsTransferredBytes(t *testing.T) {
 	payload := "hello world"
 	propsErr := errors.New("apply properties failed")
 	source := &mockTransferSource{
@@ -264,10 +339,10 @@ func TestFileTransfer_putSuccess_propertiesFailure_reportsZeroBytes(t *testing.T
 	assert.Equal(t, 1, target.putCalls)
 	assert.Equal(t, 1, target.propsCalls)
 	assert.Zero(t, target.statsCalls)
-	assert.Zero(t, result.BytesTransferred)
+	assert.Equal(t, int64(len(payload)), result.BytesTransferred)
 }
 
-func TestFileTransfer_putSuccess_statisticsFailure_reportsZeroBytes(t *testing.T) {
+func TestFileTransfer_putSuccess_statisticsFailure_keepsTransferredBytes(t *testing.T) {
 	payload := "hello world"
 	statsErr := errors.New("apply statistics failed")
 	source := &mockTransferSource{
@@ -285,7 +360,7 @@ func TestFileTransfer_putSuccess_statisticsFailure_reportsZeroBytes(t *testing.T
 	assert.Equal(t, 1, target.putCalls)
 	assert.Equal(t, 1, target.propsCalls)
 	assert.Equal(t, 1, target.statsCalls)
-	assert.Zero(t, result.BytesTransferred)
+	assert.Equal(t, int64(len(payload)), result.BytesTransferred)
 }
 
 func TestFileTransfer_retryOpensFreshGet(t *testing.T) {
@@ -357,6 +432,29 @@ func TestFileTransfer_propertiesUsesTransferOptionsSnapshot(t *testing.T) {
 
 	require.NoError(t, result.Err)
 	require.Equal(t, []TargetDeployOptions{initialOptions.TargetDeployOptions}, target.propsOptions)
+}
+
+func TestFileTransfer_canceledContextAfterGetReader_closesReader(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := &closeTrackingReadCloser{ReadCloser: io.NopCloser(strings.NewReader("hello world"))}
+	source := &mockTransferSource{
+		metadata: testFileMetadata(),
+		readerFactory: func() io.ReadCloser {
+			cancel()
+			return reader
+		},
+	}
+	target := &mockTransferTarget{checksumOutcome: ChecksumDeployMiss}
+
+	ft := NewFileTransfer(source, target, FileTransferOptions{TargetDeployOptions: defaultTargetDeployOptions()})
+	result := ft.TransferFile(ctx, testFileCandidate())
+
+	require.ErrorIs(t, result.Err, context.Canceled)
+	assert.Equal(t, api.Fail, result.Status)
+	assert.Zero(t, target.putCalls)
+	assert.Equal(t, 1, target.releaseCalls)
+	assert.True(t, reader.closed.Load())
+	assert.Equal(t, int32(1), reader.closeCalls.Load())
 }
 
 func TestFileTransfer_inFlightCancellationReturnsContextError(t *testing.T) {

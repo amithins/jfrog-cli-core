@@ -150,6 +150,29 @@ func TestStreamGetToPut_usesBoundedBuffer_notReadAll(t *testing.T) {
 	assert.LessOrEqual(t, maxRead, defaultStreamBufferSize)
 }
 
+func TestStreamGetToPut_putPanic_closesSourceAndUnblocksCopy(t *testing.T) {
+	source := newCloseUnblocksReadCloser()
+	result := make(chan error, 1)
+
+	go func() {
+		_, err := StreamGetToPut(context.Background(), 1, source, func(_ context.Context, _ io.Reader) error {
+			<-source.readStarted
+			panic("put exploded")
+		}, defaultStreamBufferSize)
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "panic in put")
+		assert.True(t, source.closed.Load())
+		assert.Equal(t, int32(1), source.closeCalls.Load())
+	case <-time.After(time.Second):
+		t.Fatal("stream transfer remained blocked after put panic")
+	}
+}
+
 func TestStreamGetToPut_retryIssuesFreshReader(t *testing.T) {
 	var getCount atomic.Int32
 	payload := strings.Repeat("retry-me", defaultStreamBufferSize)

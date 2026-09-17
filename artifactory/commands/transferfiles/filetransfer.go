@@ -21,6 +21,7 @@ type fileTransferTarget interface {
 	CreateFolder(ctx context.Context, metadata *SourceFileMetadata, options TargetDeployOptions) error
 	ApplyProperties(ctx context.Context, metadata *SourceFileMetadata, options TargetDeployOptions) (skippedLargeProps bool, err error)
 	ApplyStatistics(ctx context.Context, metadata *SourceFileMetadata) error
+	ReleaseEligibleProperties(metadata *SourceFileMetadata, options TargetDeployOptions)
 }
 
 type FileTransferOptions struct {
@@ -96,6 +97,7 @@ func (ft *FileTransfer) TransferFile(ctx context.Context, candidate api.FileRepr
 		}
 		return ft.finalizeResult(ft.failResult(result, err), startTime, nil, candidate)
 	}
+	defer ft.target.ReleaseEligibleProperties(metadata, options.TargetDeployOptions)
 
 	if metadata.Name == "" {
 		return ft.transferFolder(ctx, result, metadata, startTime, candidate, options)
@@ -115,9 +117,11 @@ func (ft *FileTransfer) TransferFile(ctx context.Context, candidate api.FileRepr
 
 	reader, err := ft.source.GetFileReader(ctx, candidate)
 	if ctxErr := ctx.Err(); ctxErr != nil {
+		closeReadCloser(reader)
 		return ft.finalizeResult(ft.failResult(result, errors.Join(err, ctxErr)), startTime, metadata, candidate)
 	}
 	if err != nil {
+		closeReadCloser(reader)
 		if IsSourceItemGone(err) {
 			result.SourceItemGone = true
 			result.Status = api.SkippedSourceItemGone
@@ -159,10 +163,10 @@ func (ft *FileTransfer) transferFolder(ctx context.Context, result TransferResul
 func (ft *FileTransfer) applyPropertiesAndStats(ctx context.Context, result TransferResult, metadata *SourceFileMetadata, options FileTransferOptions) TransferResult {
 	skippedLargeProps, err := ft.target.ApplyProperties(ctx, metadata, options.TargetDeployOptions)
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ft.failResult(result, errors.Join(err, ctxErr))
+		return failAfterContentTransfer(result, errors.Join(err, ctxErr))
 	}
 	if err != nil {
-		return ft.failResult(result, err)
+		return failAfterContentTransfer(result, err)
 	}
 	result.SkippedLargeProps = skippedLargeProps
 	if skippedLargeProps {
@@ -170,10 +174,10 @@ func (ft *FileTransfer) applyPropertiesAndStats(ctx context.Context, result Tran
 	}
 	err = ft.target.ApplyStatistics(ctx, metadata)
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ft.failResult(result, errors.Join(err, ctxErr))
+		return failAfterContentTransfer(result, errors.Join(err, ctxErr))
 	}
 	if err != nil {
-		return ft.failResult(result, err)
+		return failAfterContentTransfer(result, err)
 	}
 	return result
 }
@@ -188,6 +192,15 @@ func (ft *FileTransfer) failResult(result TransferResult, err error) TransferRes
 	result.Status = api.Fail
 	result.Err = err
 	result.BytesTransferred = 0
+	return result
+}
+
+// failAfterContentTransfer marks the item failed without clearing BytesTransferred.
+// Content may already have landed on the target (checksum-deploy hit or a completed stream)
+// before properties/stats failed.
+func failAfterContentTransfer(result TransferResult, err error) TransferResult {
+	result.Status = api.Fail
+	result.Err = err
 	return result
 }
 
@@ -211,7 +224,6 @@ func hasEligibleProperties(properties map[string][]string, options TargetDeployO
 }
 
 var (
-	_ fileTransferSource   = (*SourceClient)(nil)
-	_ fileTransferTarget   = (*TargetClient)(nil)
-	_ fileTransferExecutor = (*FileTransfer)(nil)
+	_ fileTransferSource = (*SourceClient)(nil)
+	_ fileTransferTarget = (*TargetClient)(nil)
 )
