@@ -94,7 +94,7 @@ type TargetClient struct {
 }
 
 func NewTargetClient(ctx context.Context, serverDetails *config.ServerDetails) (*TargetClient, error) {
-	metadataServiceManager, err := createTransferServiceManager(ctx, serverDetails)
+	metadataServiceManager, err := createMetadataTransferServiceManager(ctx, serverDetails)
 	if err != nil {
 		return nil, err
 	}

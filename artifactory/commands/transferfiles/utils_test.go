@@ -25,6 +25,7 @@ import (
 	"github.com/jfrog/jfrog-client-go/utils/log"
 	clientutilstests "github.com/jfrog/jfrog-client-go/utils/tests"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type transferFilesHandler func(w http.ResponseWriter, r *http.Request)
@@ -467,11 +468,43 @@ func TestUpdateThreads(t *testing.T) {
 			transferSettings := &artifactoryutils.TransferSettings{ThreadsNumber: testCase.threadsNumber}
 			assert.NoError(t, artifactoryutils.SaveTransferSettings(transferSettings))
 
-			assert.NoError(t, updateThreads(nil, testCase.buildInfo))
+			assert.NoError(t, updateThreadsWithState(nil, testCase.buildInfo, nil))
 			assert.Equal(t, testCase.expectedChunkBuilderThreads, curChunkBuilderThreads)
 			assert.Equal(t, testCase.expectedChunkUploaderThreads, curChunkUploaderThreads)
 		})
 	}
+}
+
+func TestUpdateThreads_updatesReportedWorkingThreads(t *testing.T) {
+	stateManager, cleanUp := state.InitStateTest(t)
+	defer cleanUp()
+
+	const updatedThreads = 7
+	curChunkBuilderThreads = 1
+	curChunkUploaderThreads = 1
+	require.NoError(t, artifactoryutils.SaveTransferSettings(&artifactoryutils.TransferSettings{ThreadsNumber: updatedThreads}))
+
+	require.NoError(t, updateThreadsWithState(nil, false, stateManager))
+	workingThreads, err := stateManager.GetWorkingThreads()
+	require.NoError(t, err)
+	assert.Equal(t, updatedThreads, workingThreads)
+}
+
+func TestTransferServiceManagers_useOperationSpecificRetryBudgets(t *testing.T) {
+	details := newTestTargetServerDetails("http://127.0.0.1:1")
+
+	sharedManager, err := createTransferServiceManager(context.Background(), details)
+	require.NoError(t, err)
+	assert.Equal(t, retries, sharedManager.GetConfig().GetHttpRetries())
+
+	metadataManager, err := createMetadataTransferServiceManager(context.Background(), details)
+	require.NoError(t, err)
+	assert.Equal(t, metadataTransferRetries, metadataManager.GetConfig().GetHttpRetries())
+	assert.LessOrEqual(t, metadataManager.GetConfig().GetHttpRetries(), 5)
+
+	streamManager, err := createStreamingTransferServiceManager(context.Background(), details)
+	require.NoError(t, err)
+	assert.Zero(t, streamManager.GetConfig().GetHttpRetries())
 }
 
 // Test cases for convertPatternToPathPrefix

@@ -531,7 +531,7 @@ func TestNewTargetClient_streamServiceManagerHasNoOverallTimeoutOrRetries(t *tes
 
 	metadataConfig := client.metadataServiceManager.GetConfig()
 	assert.Equal(t, time.Minute, metadataConfig.GetOverallRequestTimeout())
-	assert.Equal(t, retries, metadataConfig.GetHttpRetries())
+	assert.Equal(t, metadataTransferRetries, metadataConfig.GetHttpRetries())
 }
 
 func TestTargetClient_TryChecksumDeploy_skipsWhenSha1Empty(t *testing.T) {
