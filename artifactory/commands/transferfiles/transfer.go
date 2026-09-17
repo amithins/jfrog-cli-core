@@ -37,6 +37,8 @@ const (
 	fileWritersChannelSize       = 500000
 	retries                      = 600
 	retriesWaitMilliSecs         = 5000
+	metadataTransferRetries      = 5
+	metadataRetryWaitMilliSecs   = 1000
 	dataTransferPluginMinVersion = "1.7.0"
 	disableDistinctAqlMinVersion = "7.37"
 	// Exact UTC-millisecond timestamp expected by --created-after / --downloaded-after.
@@ -76,11 +78,15 @@ type TransferFilesCommand struct {
 	status                    bool
 	stop                      bool
 	stopSignal                chan os.Signal
+	threadDump                func() error
 	stateManager              *state.TransferStateManager
 	preChecks                 bool
 	locallyGeneratedFilter    *locallyGeneratedFilter
 	// Optimization in Artifactory version 7.37 and above enables the exclusion of setting DISTINCT in SQL queries
 	disabledDistinctiveAql bool
+	sourceClient           *SourceClient
+	targetClient           *TargetClient
+	fileTransfer           *FileTransfer
 }
 
 func NewTransferFilesCommand(sourceServer, targetServer *config.ServerDetails) (*TransferFilesCommand, error) {
@@ -240,6 +246,15 @@ func (tdc *TransferFilesCommand) Run() (err error) {
 	if err = tdc.verifySourceTargetConnectivity(srcUpService); err != nil {
 		return err
 	}
+	tdc.sourceClient, err = NewSourceClient(tdc.context, tdc.sourceServerDetails)
+	if err != nil {
+		return err
+	}
+	tdc.targetClient, err = NewTargetClient(tdc.context, tdc.targetServerDetails)
+	if err != nil {
+		return err
+	}
+	tdc.fileTransfer = NewFileTransfer(tdc.sourceClient, tdc.targetClient, FileTransferOptions{})
 
 	if err = tdc.initDistinctAql(); err != nil {
 		return err
@@ -333,7 +348,7 @@ func (tdc *TransferFilesCommand) initStateManager(allSourceLocalRepos, sourceBui
 	tdc.stateManager.OverallTransfer.TotalUnits = totalFiles
 	tdc.stateManager.TotalRepositories.TotalUnits = int64(len(allSourceLocalRepos))
 	tdc.stateManager.OverallBiFiles.TotalUnits = totalBiFiles
-	tdc.stateManager.CurrentTotalTransferredBytes = 0
+	tdc.stateManager.TimeEstimationManager.ResetCurrentTotalTransferredBytes()
 	if !tdc.ignoreState {
 		numberInitialErrors, e := getRetryErrorCount(allSourceLocalRepos)
 		if e != nil {
@@ -642,7 +657,7 @@ func (tdc *TransferFilesCommand) handleStop(srcUpService *srcUserPluginService) 
 			return
 		}
 		// Before interrupting the process, do a thread dump
-		if err := doThreadDump(); err != nil {
+		if err := tdc.dumpThreads(); err != nil {
 			log.Error(err)
 		}
 		tdc.cancelFunc()
@@ -685,6 +700,17 @@ func (tdc *TransferFilesCommand) initNewPhase(newPhase transferPhase, srcUpServi
 	newPhase.setMinCheckSumDeploySize(minChecksumDeploySize)
 	newPhase.setIncludeFilesPatterns(tdc.includeFilesPatterns)
 	newPhase.setTimestampFilter(tdc.timestampFilter)
+	if tdc.fileTransfer != nil {
+		tdc.fileTransfer.ConfigureOptions(FileTransferOptions{
+			TargetDeployOptions: TargetDeployOptions{
+				BuildInfoRepo:             buildInfoRepo,
+				MinChecksumDeploySize:     minChecksumDeploySize,
+				CheckExistenceInFilestore: tdc.checkExistenceInFilestore,
+				PackageType:               repoSummary.PackageType,
+			},
+		})
+	}
+	newPhase.setFileTransfer(tdc.fileTransfer)
 }
 
 // Get all local and build-info repositories of the input server
@@ -937,6 +963,13 @@ func parseErrorsFromLogFiles(logPaths []string) (allErrors FilesErrors, err erro
 
 func assertSupportedTransferDirStructure() error {
 	return state.VerifyTransferRunStatusVersion()
+}
+
+func (tdc *TransferFilesCommand) dumpThreads() error {
+	if tdc.threadDump != nil {
+		return tdc.threadDump()
+	}
+	return doThreadDump()
 }
 
 func doThreadDump() error {

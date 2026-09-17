@@ -337,16 +337,17 @@ func (ts *TransferStateManager) SetRepoPhase(phaseId int) error {
 
 func (ts *TransferStateManager) SetWorkingThreads(workingThreads int) error {
 	return ts.action(func(transferRunStatus *TransferRunStatus) error {
+		workingThreadsMutex.Lock()
+		defer workingThreadsMutex.Unlock()
 		transferRunStatus.WorkingThreads = workingThreads
 		return nil
 	})
 }
 
-func (ts *TransferStateManager) GetWorkingThreads() (workingThreads int, err error) {
-	return workingThreads, ts.action(func(transferRunStatus *TransferRunStatus) error {
-		workingThreads = transferRunStatus.WorkingThreads
-		return nil
-	})
+func (ts *TransferStateManager) GetWorkingThreads() (int, error) {
+	workingThreadsMutex.RLock()
+	defer workingThreadsMutex.RUnlock()
+	return ts.WorkingThreads, nil
 }
 
 func (ts *TransferStateManager) SetStaleChunks(staleChunks []StaleChunks) error {

@@ -46,6 +46,73 @@ func TestCancelFunc(t *testing.T) {
 	assert.True(t, transferFilesCommand.shouldStop())
 }
 
+func TestCancelFuncCancelsInFlightTransferFile(t *testing.T) {
+	transferFilesCommand, err := NewTransferFilesCommand(nil, nil)
+	require.NoError(t, err)
+
+	source := &cancelAwareTransferSource{started: make(chan struct{})}
+	fileTransfer := NewFileTransfer(source, &mockTransferTarget{}, FileTransferOptions{})
+	resultChannel := make(chan TransferResult, 1)
+	go func() {
+		resultChannel <- fileTransfer.TransferFile(transferFilesCommand.context, testFileCandidate())
+	}()
+
+	<-source.started
+	transferFilesCommand.cancelFunc()
+
+	select {
+	case result := <-resultChannel:
+		require.ErrorIs(t, result.Err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight TransferFile did not return promptly after stop")
+	}
+}
+
+func TestHandleStopDumpsThreadsBeforeCancelingInFlightTransferFile(t *testing.T) {
+	testServer, serverDetails, srcUpService := createMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write([]byte(`{"isHa":false,"nodes":[]}`))
+		assert.NoError(t, err)
+	})
+	defer testServer.Close()
+
+	transferFilesCommand, err := NewTransferFilesCommand(serverDetails, nil)
+	require.NoError(t, err)
+	dumpStarted := make(chan struct{})
+	finishDump := make(chan struct{})
+	transferFilesCommand.threadDump = func() error {
+		close(dumpStarted)
+		<-finishDump
+		return nil
+	}
+	finishStopping, _ := transferFilesCommand.handleStop(srcUpService)
+	defer finishStopping()
+
+	source := &cancelAwareTransferSource{started: make(chan struct{})}
+	fileTransfer := NewFileTransfer(source, &mockTransferTarget{}, FileTransferOptions{})
+	resultChannel := make(chan TransferResult, 1)
+	go func() {
+		resultChannel <- fileTransfer.TransferFile(transferFilesCommand.context, testFileCandidate())
+	}()
+
+	<-source.started
+	transferFilesCommand.stopSignal <- os.Interrupt
+	<-dumpStarted
+	select {
+	case <-transferFilesCommand.context.Done():
+		t.Fatal("transfer context was canceled before thread dump finished")
+	default:
+	}
+
+	close(finishDump)
+	select {
+	case result := <-resultChannel:
+		require.ErrorIs(t, result.Err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight TransferFile did not return promptly after thread dump finished")
+	}
+}
+
 func TestSignalStop(t *testing.T) {
 	cleanUpJfrogHome, err := tests.SetJfrogHome()
 	assert.NoError(t, err)
