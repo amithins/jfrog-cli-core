@@ -9,11 +9,14 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
+	transferutils "github.com/jfrog/jfrog-cli-core/v2/artifactory/utils"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/config"
+	artifactoryutils "github.com/jfrog/jfrog-client-go/artifactory/services/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -159,10 +162,12 @@ func TestTargetClient_TryChecksumDeploy_skipsBuildInfoRepo(t *testing.T) {
 func TestTargetClient_TryChecksumDeploy_filestoreOptionHeaders(t *testing.T) {
 	var binaryExistenceHeader string
 	var md5Header string
+	var md5Present bool
 	var binarySizeHeader string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		binaryExistenceHeader = r.Header.Get("X-Check-Binary-Existence-In-Filestore")
+		_, md5Present = r.Header["X-Checksum-Md5"]
 		md5Header = r.Header.Get("X-Checksum-Md5")
 		binarySizeHeader = r.Header.Get("X-Binary-Size")
 		w.WriteHeader(http.StatusAccepted)
@@ -178,6 +183,7 @@ func TestTargetClient_TryChecksumDeploy_filestoreOptionHeaders(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, ChecksumDeployHit, outcome)
 	assert.Equal(t, "true", binaryExistenceHeader)
+	assert.True(t, md5Present, "X-Checksum-Md5 must be present on filestore-existence checksum-deploy")
 	assert.Equal(t, "md5-value", md5Header)
 	assert.Equal(t, strconv.FormatInt(testTargetMetadata().Size, 10), binarySizeHeader)
 }
@@ -188,14 +194,16 @@ func TestTargetClient_Put_setsContentLengthAndChecksumHeaders(t *testing.T) {
 	var contentLength string
 	var sha1Header string
 	var sha256Header string
+	var md5Present bool
 	var bodyBytes []byte
+	var requestPath string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.True(t, strings.HasPrefix(r.URL.Path, deployPath))
-		assert.Contains(t, r.URL.Path, ";build.name=")
+		requestPath = r.URL.Path
 		contentLength = r.Header.Get("Content-Length")
 		sha1Header = r.Header.Get("X-Checksum-Sha1")
 		sha256Header = r.Header.Get("X-Checksum")
+		_, md5Present = r.Header["X-Checksum-Md5"]
 		bodyBytes, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusCreated)
 	}))
@@ -207,9 +215,12 @@ func TestTargetClient_Put_setsContentLengthAndChecksumHeaders(t *testing.T) {
 	metadata := testTargetMetadata()
 	err = client.Put(context.Background(), metadata, strings.NewReader(payload), defaultTargetDeployOptions())
 	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(requestPath, deployPath))
+	assert.Contains(t, requestPath, ";build.name=")
 	assert.Equal(t, strconv.FormatInt(metadata.Size, 10), contentLength)
 	assert.Equal(t, metadata.Sha1, sha1Header)
 	assert.Equal(t, metadata.Sha256, sha256Header)
+	assert.False(t, md5Present, "X-Checksum-Md5 must be absent on plain Put")
 	assert.Equal(t, payload, string(bodyBytes))
 }
 
@@ -252,8 +263,8 @@ func TestTargetClient_ApplyProperties_omitsValuesLongerThan2400(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, skippedLargeProps)
 	assert.Zero(t, requestCount)
-	assert.Contains(t, propertyMatrixSuffix(metadata, defaultTargetDeployOptions()), ";short=")
-	assert.NotContains(t, propertyMatrixSuffix(metadata, defaultTargetDeployOptions()), "long")
+	assert.Contains(t, client.propertyMatrixSuffix(metadata, defaultTargetDeployOptions()), ";short=")
+	assert.NotContains(t, client.propertyMatrixSuffix(metadata, defaultTargetDeployOptions()), "long")
 }
 
 func TestTargetClient_ApplyProperties_usesPatchWhenEncodedPayloadExceeds4000(t *testing.T) {
@@ -294,12 +305,6 @@ func TestTargetClient_ApplyProperties_usesPatchWhenEncodedPayloadExceeds4000(t *
 }
 
 func TestTargetClient_ApplyProperties_usesPutQueryWhenEncodedPayloadAtMost4000(t *testing.T) {
-	metadata := testTargetMetadata()
-	suffix := propertyMatrixSuffix(metadata, defaultTargetDeployOptions())
-	assert.True(t, strings.HasPrefix(suffix, ";"))
-	assert.Contains(t, suffix, "build.name=")
-	assert.LessOrEqual(t, len(strings.TrimPrefix(suffix, ";")), maxPropertyEncodedStringLength)
-
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requestCount++
@@ -309,6 +314,12 @@ func TestTargetClient_ApplyProperties_usesPutQueryWhenEncodedPayloadAtMost4000(t
 
 	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
 	require.NoError(t, err)
+
+	metadata := testTargetMetadata()
+	suffix := client.propertyMatrixSuffix(metadata, defaultTargetDeployOptions())
+	assert.True(t, strings.HasPrefix(suffix, ";"))
+	assert.Contains(t, suffix, "build.name=")
+	assert.LessOrEqual(t, len(strings.TrimPrefix(suffix, ";")), maxPropertyEncodedStringLength)
 
 	_, err = client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
 	require.NoError(t, err)
@@ -328,14 +339,6 @@ func TestTargetClient_ApplyProperties_stripsGeneratedPropertyKeys(t *testing.T) 
 		"conan.settings.compiler":      {"gcc"},
 	}
 
-	suffix := propertyMatrixSuffix(metadata, defaultTargetDeployOptions())
-	assert.Contains(t, suffix, "build.name=")
-	assert.NotContains(t, suffix, "artifactory.licenses")
-	assert.NotContains(t, suffix, "artifactory.metadata.exclude")
-	assert.NotContains(t, suffix, "package.lowercase")
-	assert.NotContains(t, suffix, "baseUrl")
-	assert.NotContains(t, suffix, "conan.settings.os")
-
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		requestCount++
@@ -345,6 +348,14 @@ func TestTargetClient_ApplyProperties_stripsGeneratedPropertyKeys(t *testing.T) 
 	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
 	require.NoError(t, err)
 
+	suffix := client.propertyMatrixSuffix(metadata, defaultTargetDeployOptions())
+	assert.Contains(t, suffix, "build.name=")
+	assert.NotContains(t, suffix, "artifactory.licenses")
+	assert.NotContains(t, suffix, "artifactory.metadata.exclude")
+	assert.NotContains(t, suffix, "package.lowercase")
+	assert.NotContains(t, suffix, "baseUrl")
+	assert.NotContains(t, suffix, "conan.settings.os")
+
 	skippedLargeProps, err := client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
 	require.NoError(t, err)
 	assert.False(t, skippedLargeProps)
@@ -352,12 +363,19 @@ func TestTargetClient_ApplyProperties_stripsGeneratedPropertyKeys(t *testing.T) 
 }
 
 func TestTargetClient_ApplyProperties_preservesMultiValues(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+
 	metadata := testTargetMetadata()
 	metadata.Properties = map[string][]string{
 		"env": {"prod", "release"},
 	}
-
-	suffix := propertyMatrixSuffix(metadata, defaultTargetDeployOptions())
+	suffix := client.propertyMatrixSuffix(metadata, defaultTargetDeployOptions())
 	assert.Contains(t, suffix, "env=prod")
 	assert.Contains(t, suffix, "env=release")
 }
@@ -375,12 +393,13 @@ func TestTargetClient_CreateFolder_putsZeroByteBody(t *testing.T) {
 	deployPath := "/" + testTargetRepo + "/empty-dir/"
 	var contentLength string
 	var bodyBytes []byte
+	var requestPath string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath = r.URL.Path
 		contentLength = r.Header.Get("Content-Length")
 		bodyBytes, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusCreated)
-		require.Equal(t, deployPath, r.URL.Path)
 	}))
 	defer server.Close()
 
@@ -389,6 +408,7 @@ func TestTargetClient_CreateFolder_putsZeroByteBody(t *testing.T) {
 
 	err = client.CreateFolder(context.Background(), folderMetadata, defaultTargetDeployOptions())
 	require.NoError(t, err)
+	assert.Equal(t, deployPath, requestPath)
 	assert.Equal(t, "0", contentLength)
 	assert.Empty(t, bodyBytes)
 }
@@ -413,10 +433,9 @@ func TestTargetClient_noPluginExecuteURLs(t *testing.T) {
 	}
 }
 
-func TestTargetClient_checksumDeploy409DoesNotInvokePut(t *testing.T) {
+func TestTargetClient_checksumDeploy409IsHardFailure(t *testing.T) {
 	deployPath := "/" + testTargetRelativePath()
 	checksumDeployCalls := 0
-	fullPutCalls := 0
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, deployPath) || r.Method != http.MethodPut {
@@ -429,7 +448,7 @@ func TestTargetClient_checksumDeploy409DoesNotInvokePut(t *testing.T) {
 			_, _ = w.Write([]byte(`{"errors":[{"message":"checksum conflict"}]}`))
 			return
 		}
-		fullPutCalls++
+		t.Errorf("unexpected non-checksum-deploy PUT to %s", r.URL.Path)
 		w.WriteHeader(http.StatusCreated)
 	}))
 	defer server.Close()
@@ -437,18 +456,11 @@ func TestTargetClient_checksumDeploy409DoesNotInvokePut(t *testing.T) {
 	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
 	require.NoError(t, err)
 
-	source := &mockTransferSource{
-		metadata: testFileMetadata(),
-		reader:   io.NopCloser(strings.NewReader("hello world")),
-	}
-	ft := NewFileTransfer(source, client, FileTransferOptions{TargetDeployOptions: defaultTargetDeployOptions()})
-	result := ft.TransferFile(context.Background(), testFileCandidate())
-
-	require.Error(t, result.Err)
-	assert.Equal(t, api.Fail, result.Status)
+	outcome, err := client.TryChecksumDeploy(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
+	assert.Equal(t, ChecksumDeployMiss, outcome)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "permanent target HTTP 409")
 	assert.Equal(t, 1, checksumDeployCalls)
-	assert.Zero(t, fullPutCalls)
-	assert.Zero(t, source.getReaderCalls)
 }
 
 func largeEligiblePropertiesMap(t *testing.T) map[string][]string {
@@ -626,7 +638,11 @@ func TestTargetClient_ApplyStatistics_putsItemStatisticsXML(t *testing.T) {
 		requestPath = r.URL.Path
 		contentType = r.Header.Get("Content-Type")
 		body, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		requestBody = string(body)
 		w.WriteHeader(http.StatusCreated)
 	}))
@@ -702,4 +718,245 @@ func TestTargetClient_ApplyStatistics_skipsFolders(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Zero(t, requestCount)
+}
+
+func TestTargetClient_sendsTargetCredentials(t *testing.T) {
+	var receivedAuth []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = append(receivedAuth, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	details := newTestTargetServerDetails(server.URL)
+	details.AccessToken = "target-secret-token"
+	client, err := NewTargetClient(context.Background(), details)
+	require.NoError(t, err)
+
+	require.NoError(t, client.Ping(context.Background()))
+	assert.NotEmpty(t, receivedAuth)
+	for i, auth := range receivedAuth {
+		assert.Equal(t, "Bearer target-secret-token", auth, "request %d", i)
+	}
+}
+
+func TestTargetClient_TryChecksumDeploy_permanent4xxFailsFast(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"forbidden"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+
+	outcome, err := client.TryChecksumDeploy(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
+	assert.Equal(t, ChecksumDeployMiss, outcome)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "permanent target HTTP 403")
+	assert.Equal(t, 1, requestCount, "4xx other than 429 must not be retried")
+}
+
+func TestTargetClient_TryChecksumDeploy_retryableStatusUsesMetadataRetryPolicy(t *testing.T) {
+	const metadataRetries = 2
+	for _, testCase := range []struct {
+		name       string
+		statusCode int
+	}{
+		{name: "too many requests", statusCode: http.StatusTooManyRequests},
+		{name: "server error", statusCode: http.StatusServiceUnavailable},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			requestCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requestCount++
+				w.WriteHeader(testCase.statusCode)
+			}))
+			defer server.Close()
+
+			details := newTestTargetServerDetails(server.URL)
+			client, err := NewTargetClient(context.Background(), details)
+			require.NoError(t, err)
+			client.metadataServiceManager, err = transferutils.CreateServiceManagerWithContext(
+				context.Background(), details, false, 0, metadataRetries, 0, time.Minute,
+			)
+			require.NoError(t, err)
+
+			outcome, err := client.TryChecksumDeploy(
+				context.Background(), testTargetMetadata(), defaultTargetDeployOptions(),
+			)
+			assert.Equal(t, ChecksumDeployMiss, outcome)
+			require.Error(t, err)
+			assert.Equal(t, metadataRetries, client.metadataServiceManager.GetConfig().GetHttpRetries())
+			assert.Equal(t, metadataRetries+1, requestCount,
+				"retryable responses must use the configured metadata retries plus the initial attempt")
+		})
+	}
+}
+
+func TestTargetClient_eligiblePropertiesComputedOnceAcrossFileAndFolderOperations(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Header.Get("X-Checksum-Deploy") == "true":
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodPatch:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+	var filterCalls atomic.Int32
+	client.filterEligibleProperties = func(
+		properties map[string][]string, options TargetDeployOptions,
+	) (*artifactoryutils.Properties, bool) {
+		filterCalls.Add(1)
+		return filterEligibleProperties(properties, options)
+	}
+
+	fileMetadata := testTargetMetadata()
+	fileMetadata.Properties = largeEligiblePropertiesMap(t)
+	options := defaultTargetDeployOptions()
+	outcome, err := client.TryChecksumDeploy(context.Background(), fileMetadata, options)
+	require.NoError(t, err)
+	assert.Equal(t, ChecksumDeployMiss, outcome)
+	require.NoError(t, client.Put(context.Background(), fileMetadata, strings.NewReader("hello world"), options))
+	_, err = client.ApplyProperties(context.Background(), fileMetadata, options)
+	require.NoError(t, err)
+
+	folderMetadata := &SourceFileMetadata{
+		Repo:       testTargetRepo,
+		Path:       "empty-dir",
+		Properties: largeEligiblePropertiesMap(t),
+	}
+	require.NoError(t, client.CreateFolder(context.Background(), folderMetadata, options))
+	_, err = client.ApplyProperties(context.Background(), folderMetadata, options)
+	require.NoError(t, err)
+
+	assert.Equal(t, int32(2), filterCalls.Load(),
+		"each file or folder transfer must compute eligible properties once across all target operations")
+}
+
+func TestTargetClient_concurrentTransfersDoNotEvictEligibleProperties(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+	var filterCalls atomic.Int32
+	client.filterEligibleProperties = func(
+		properties map[string][]string, options TargetDeployOptions,
+	) (*artifactoryutils.Properties, bool) {
+		filterCalls.Add(1)
+		return filterEligibleProperties(properties, options)
+	}
+
+	const transfers = 8
+	metadata := make([]*SourceFileMetadata, transfers)
+	for i := range metadata {
+		metadata[i] = &SourceFileMetadata{
+			Repo:       testTargetRepo,
+			Path:       fmt.Sprintf("folder-%d", i),
+			Properties: largeEligiblePropertiesMap(t),
+		}
+	}
+	options := defaultTargetDeployOptions()
+	runConcurrently := func(operation func(*SourceFileMetadata) error) {
+		var waitGroup sync.WaitGroup
+		errors := make(chan error, len(metadata))
+		for _, item := range metadata {
+			waitGroup.Add(1)
+			go func() {
+				defer waitGroup.Done()
+				errors <- operation(item)
+			}()
+		}
+		waitGroup.Wait()
+		close(errors)
+		for operationErr := range errors {
+			require.NoError(t, operationErr)
+		}
+	}
+
+	runConcurrently(func(item *SourceFileMetadata) error {
+		return client.CreateFolder(context.Background(), item, options)
+	})
+	runConcurrently(func(item *SourceFileMetadata) error {
+		_, applyErr := client.ApplyProperties(context.Background(), item, options)
+		return applyErr
+	})
+
+	assert.Equal(t, int32(transfers), filterCalls.Load(),
+		"concurrent transfers must retain each transfer's cached eligible properties")
+}
+
+func TestTargetClient_Put_errorReleasesEligibleProperties(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"forbidden"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+
+	metadata := testTargetMetadata()
+	options := defaultTargetDeployOptions()
+	err = client.Put(context.Background(), metadata, strings.NewReader("hello world"), options)
+	require.Error(t, err)
+	assert.False(t, eligibleCacheHas(client, metadata, options),
+		"failed Put must release eligibleCache without ApplyProperties")
+}
+
+func TestTargetClient_CreateFolder_errorReleasesEligibleProperties(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"forbidden"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+
+	metadata := &SourceFileMetadata{
+		Repo:       testTargetRepo,
+		Path:       "empty-dir",
+		Properties: map[string][]string{"build.name": {"app"}},
+	}
+	options := defaultTargetDeployOptions()
+	err = client.CreateFolder(context.Background(), metadata, options)
+	require.Error(t, err)
+	assert.False(t, eligibleCacheHas(client, metadata, options),
+		"failed CreateFolder must release eligibleCache without ApplyProperties")
+}
+
+func eligibleCacheHas(tc *TargetClient, metadata *SourceFileMetadata, options TargetDeployOptions) bool {
+	tc.eligibleMu.Lock()
+	defer tc.eligibleMu.Unlock()
+	_, ok := tc.eligibleCache[eligiblePropertiesCacheKey{metadata: metadata, packageType: options.PackageType}]
+	return ok
+}
+
+func Test_filterEligibleProperties_usesPackageType(t *testing.T) {
+	properties := map[string][]string{
+		"build.name":  {"app"},
+		"npm.name":    {"pkg"},
+		"npm.version": {"1.0.0"},
+	}
+	options := TargetDeployOptions{PackageType: "npm"}
+	eligibleProps, skippedLargeProps := filterEligibleProperties(properties, options)
+	assert.False(t, skippedLargeProps)
+	assert.Equal(t, 1, eligibleProps.KeysLen())
+	assert.Equal(t, map[string][]string{"build.name": {"app"}}, eligibleProps.ToMap())
 }

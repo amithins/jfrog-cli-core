@@ -10,24 +10,28 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/jfrog/build-info-go/entities"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/config"
 	"github.com/jfrog/jfrog-client-go/artifactory"
 	artifactoryutils "github.com/jfrog/jfrog-client-go/artifactory/services/utils"
 	"github.com/jfrog/jfrog-client-go/auth"
 	clientutils "github.com/jfrog/jfrog-client-go/utils"
 	"github.com/jfrog/jfrog-client-go/utils/errorutils"
-	"github.com/jfrog/jfrog-client-go/utils/io/fileutils"
 	"github.com/jfrog/jfrog-client-go/utils/io/httputils"
 	"github.com/jfrog/jfrog-client-go/utils/log"
 )
 
 const (
-	maxPropertyValueLength         = 2400
+	maxPropertyValueLength = 2400
+	// D1: properties whose encoded matrix string exceeds 4000 chars are sent via PATCH
+	// (/api/metadata) instead of the deploy URL matrix params.
 	maxPropertyEncodedStringLength = 4000
-	itemStatisticsSuffix           = ":statistics"
+	// itemStatisticsSuffix is Artifactory's internal PUT target for writing download
+	// statistics onto an existing item (path + ":statistics"). The target must accept
+	// application/xml artifactory.stats bodies on that suffix.
+	itemStatisticsSuffix = ":statistics"
 )
 
 type artifactoryStatsXML struct {
@@ -55,10 +59,26 @@ const (
 	ChecksumDeployHit
 )
 
+type eligiblePropertiesCacheKey struct {
+	metadata    *SourceFileMetadata
+	packageType string
+}
+
+type eligiblePropertiesCacheValue struct {
+	properties   *artifactoryutils.Properties
+	skippedLarge bool
+}
+
 type TargetClient struct {
 	serverDetails          *config.ServerDetails
 	metadataServiceManager artifactory.ArtifactoryServicesManager
 	streamServiceManager   artifactory.ArtifactoryServicesManager
+
+	// eligibleCache retains one result per file/folder transfer so concurrent workers
+	// cannot evict each other's result between target operations.
+	eligibleMu               sync.Mutex
+	eligibleCache            map[eligiblePropertiesCacheKey]eligiblePropertiesCacheValue
+	filterEligibleProperties func(map[string][]string, TargetDeployOptions) (*artifactoryutils.Properties, bool)
 }
 
 func NewTargetClient(ctx context.Context, serverDetails *config.ServerDetails) (*TargetClient, error) {
@@ -71,9 +91,11 @@ func NewTargetClient(ctx context.Context, serverDetails *config.ServerDetails) (
 		return nil, err
 	}
 	return &TargetClient{
-		serverDetails:          serverDetails,
-		metadataServiceManager: metadataServiceManager,
-		streamServiceManager:   streamServiceManager,
+		serverDetails:            serverDetails,
+		metadataServiceManager:   metadataServiceManager,
+		streamServiceManager:     streamServiceManager,
+		eligibleCache:            make(map[eligiblePropertiesCacheKey]eligiblePropertiesCacheValue),
+		filterEligibleProperties: filterEligibleProperties,
 	}, nil
 }
 
@@ -96,11 +118,13 @@ func (tc *TargetClient) TryChecksumDeploy(ctx context.Context, metadata *SourceF
 	if err != nil {
 		return ChecksumDeployMiss, err
 	}
-	deployURL += propertyMatrixSuffix(metadata, options)
+	eligibleProps, _ := tc.eligibleProperties(metadata, options)
+	deployURL += propertyMatrixSuffixFromEligible(eligibleProps)
 	httpClientsDetails := tc.metadataServiceManager.GetConfig().GetServiceDetails().CreateHttpClientDetails()
 	addDeployHeaders(&httpClientsDetails, tc.metadataServiceManager.GetConfig().GetServiceDetails(), metadata, options, true)
 	resp, body, err := tc.metadataServiceManager.Client().SendPut(deployURL, nil, &httpClientsDetails)
 	if err != nil {
+		tc.ReleaseEligibleProperties(metadata, options)
 		return ChecksumDeployMiss, err
 	}
 	if isChecksumDeployHit(resp.StatusCode) {
@@ -109,7 +133,11 @@ func (tc *TargetClient) TryChecksumDeploy(ctx context.Context, metadata *SourceF
 	if isChecksumDeployMiss(resp.StatusCode) {
 		return ChecksumDeployMiss, nil
 	}
-	return ChecksumDeployMiss, errorutils.CheckResponseStatusWithBody(resp, body, http.StatusOK, http.StatusCreated, http.StatusAccepted)
+	if err = permanentOrRetryableResponseError(resp, body, http.StatusOK, http.StatusCreated, http.StatusAccepted); err != nil {
+		tc.ReleaseEligibleProperties(metadata, options)
+		return ChecksumDeployMiss, err
+	}
+	return ChecksumDeployMiss, nil
 }
 
 func (tc *TargetClient) Put(ctx context.Context, metadata *SourceFileMetadata, reader io.Reader, options TargetDeployOptions) error {
@@ -120,22 +148,27 @@ func (tc *TargetClient) Put(ctx context.Context, metadata *SourceFileMetadata, r
 	if err != nil {
 		return err
 	}
-	deployURL += propertyMatrixSuffix(metadata, options)
-	details := fileDetailsFromMetadata(metadata)
+	eligibleProps, _ := tc.eligibleProperties(metadata, options)
+	deployURL += propertyMatrixSuffixFromEligible(eligibleProps)
 	httpClientsDetails := tc.streamServiceManager.GetConfig().GetServiceDetails().CreateHttpClientDetails()
 	addDeployHeaders(&httpClientsDetails, tc.streamServiceManager.GetConfig().GetServiceDetails(), metadata, options, false)
-	artDetails := tc.streamServiceManager.GetConfig().GetServiceDetails()
-	resp, body, err := artifactoryutils.UploadFileFromReader(reader, deployURL, &artDetails, details, httpClientsDetails, tc.streamServiceManager.Client())
+	// Skip artifactoryutils.UploadFileFromReader: it always AddChecksumHeaders including
+	// X-Checksum-Md5 (even when Md5 is empty). Plain PUT must omit that header; it is
+	// reserved for CheckExistenceInFilestore checksum-deploy.
+	resp, body, err := tc.streamServiceManager.Client().UploadFileFromReader(reader, deployURL, &httpClientsDetails, metadata.Size)
 	if err != nil {
+		tc.ReleaseEligibleProperties(metadata, options)
 		return err
 	}
 	if resp == nil {
+		tc.ReleaseEligibleProperties(metadata, options)
 		return errorutils.CheckErrorf("received empty response from target deploy")
 	}
 	if isSuccessfulDeployStatusCode(resp.StatusCode) {
 		return nil
 	}
-	return errorutils.CheckResponseStatusWithBody(resp, body, http.StatusOK, http.StatusCreated, http.StatusAccepted)
+	tc.ReleaseEligibleProperties(metadata, options)
+	return permanentOrRetryableResponseError(resp, body, http.StatusOK, http.StatusCreated, http.StatusAccepted)
 }
 
 func (tc *TargetClient) CreateFolder(ctx context.Context, metadata *SourceFileMetadata, options TargetDeployOptions) error {
@@ -146,24 +179,28 @@ func (tc *TargetClient) CreateFolder(ctx context.Context, metadata *SourceFileMe
 	if err != nil {
 		return err
 	}
-	deployURL += propertyMatrixSuffix(metadata, options)
+	eligibleProps, _ := tc.eligibleProperties(metadata, options)
+	deployURL += propertyMatrixSuffixFromEligible(eligibleProps)
 	httpClientsDetails := tc.metadataServiceManager.GetConfig().GetServiceDetails().CreateHttpClientDetails()
 	addIdentityHeaders(&httpClientsDetails, metadata)
 	resp, body, err := tc.metadataServiceManager.Client().SendPut(deployURL, nil, &httpClientsDetails)
 	if err != nil {
+		tc.ReleaseEligibleProperties(metadata, options)
 		return err
 	}
 	if isSuccessfulDeployStatusCode(resp.StatusCode) {
 		return nil
 	}
-	return errorutils.CheckResponseStatusWithBody(resp, body, http.StatusOK, http.StatusCreated, http.StatusAccepted)
+	tc.ReleaseEligibleProperties(metadata, options)
+	return permanentOrRetryableResponseError(resp, body, http.StatusOK, http.StatusCreated, http.StatusAccepted)
 }
 
 func (tc *TargetClient) ApplyProperties(ctx context.Context, metadata *SourceFileMetadata, options TargetDeployOptions) (skippedLargeProps bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	eligibleProps, skippedLargeProps := filterEligibleProperties(metadata.Properties, options)
+	eligibleProps, skippedLargeProps := tc.eligibleProperties(metadata, options)
+	defer tc.ReleaseEligibleProperties(metadata, options)
 	if eligibleProps.KeysLen() == 0 {
 		return skippedLargeProps, nil
 	}
@@ -190,7 +227,7 @@ func (tc *TargetClient) applyPropertiesViaPatch(relativePath string, eligiblePro
 	if err != nil {
 		return err
 	}
-	return errorutils.CheckResponseStatusWithBody(resp, body, http.StatusNoContent)
+	return permanentOrRetryableResponseError(resp, body, http.StatusNoContent)
 }
 
 func (tc *TargetClient) ApplyStatistics(ctx context.Context, metadata *SourceFileMetadata) error {
@@ -222,12 +259,45 @@ func (tc *TargetClient) ApplyStatistics(ctx context.Context, metadata *SourceFil
 		log.Warn("Couldn't set stats for", relativePath+". Reason:", err.Error())
 		return nil
 	}
-	if err = errorutils.CheckResponseStatusWithBody(resp, body, http.StatusOK, http.StatusCreated, http.StatusNoContent); err != nil {
+	if err = permanentOrRetryableResponseError(resp, body, http.StatusOK, http.StatusCreated, http.StatusNoContent); err != nil {
 		log.Warn("Couldn't set stats for", relativePath+". Reason:", err.Error())
 		return nil
 	}
 	log.Debug("Applied download statistics for", targetRelativePath(metadata))
 	return nil
+}
+
+// eligibleProperties returns the filtered property set for one file/folder transfer.
+// The metadata pointer is the transfer identity shared by all target operations.
+func (tc *TargetClient) eligibleProperties(metadata *SourceFileMetadata, options TargetDeployOptions) (*artifactoryutils.Properties, bool) {
+	cacheKey := eligiblePropertiesCacheKey{metadata: metadata, packageType: options.PackageType}
+	tc.eligibleMu.Lock()
+	if cached, ok := tc.eligibleCache[cacheKey]; ok {
+		tc.eligibleMu.Unlock()
+		return cached.properties, cached.skippedLarge
+	}
+	tc.eligibleMu.Unlock()
+
+	eligible, skipped := tc.filterEligibleProperties(metadata.Properties, options)
+
+	tc.eligibleMu.Lock()
+	defer tc.eligibleMu.Unlock()
+	if cached, ok := tc.eligibleCache[cacheKey]; ok {
+		return cached.properties, cached.skippedLarge
+	}
+	tc.eligibleCache[cacheKey] = eligiblePropertiesCacheValue{properties: eligible, skippedLarge: skipped}
+	return eligible, skipped
+}
+
+// ReleaseEligibleProperties drops the cached eligible properties for one transfer item.
+// Callers that never reach ApplyProperties should defer this after the metadata pointer is known.
+func (tc *TargetClient) ReleaseEligibleProperties(metadata *SourceFileMetadata, options TargetDeployOptions) {
+	if metadata == nil {
+		return
+	}
+	tc.eligibleMu.Lock()
+	defer tc.eligibleMu.Unlock()
+	delete(tc.eligibleCache, eligiblePropertiesCacheKey{metadata: metadata, packageType: options.PackageType})
 }
 
 func hasDownloadStatistics(metadata *SourceFileMetadata) bool {
@@ -262,18 +332,19 @@ func shouldTryChecksumDeploy(metadata *SourceFileMetadata, options TargetDeployO
 	return metadata.Size >= options.MinChecksumDeploySize
 }
 
-func fileDetailsFromMetadata(metadata *SourceFileMetadata) *fileutils.FileDetails {
-	return &fileutils.FileDetails{
-		Size: metadata.Size,
-		Checksum: entities.Checksum{
-			Sha1: metadata.Sha1, Sha256: metadata.Sha256, Md5: metadata.Md5,
-		},
-	}
-}
-
 func addDeployHeaders(httpClientsDetails *httputils.HttpClientDetails, serviceDetails auth.ServiceDetails, metadata *SourceFileMetadata, options TargetDeployOptions, checksumDeploy bool) {
 	addIdentityHeaders(httpClientsDetails, metadata)
-	artifactoryutils.AddChecksumHeaders(httpClientsDetails.Headers, fileDetailsFromMetadata(metadata))
+	if httpClientsDetails.Headers == nil {
+		httpClientsDetails.Headers = make(map[string]string)
+	}
+	// Always send sha1/sha256 on deploy. X-Checksum-Md5 is reserved for the
+	// CheckExistenceInFilestore checksum-deploy path only (below).
+	if metadata.Sha1 != "" {
+		httpClientsDetails.Headers["X-Checksum-Sha1"] = metadata.Sha1
+	}
+	if metadata.Sha256 != "" {
+		httpClientsDetails.Headers["X-Checksum"] = metadata.Sha256
+	}
 	artifactoryutils.AddAuthHeaders(httpClientsDetails.Headers, serviceDetails)
 	if checksumDeploy {
 		httpClientsDetails.AddHeader("X-Checksum-Deploy", "true")
@@ -332,12 +403,16 @@ func filterEligibleProperties(properties map[string][]string, options TargetDepl
 	return eligibleProps, skippedLargeProps
 }
 
-func propertyMatrixSuffix(metadata *SourceFileMetadata, options TargetDeployOptions) string {
+func (tc *TargetClient) propertyMatrixSuffix(metadata *SourceFileMetadata, options TargetDeployOptions) string {
 	if metadata == nil {
 		return ""
 	}
-	eligibleProps, _ := filterEligibleProperties(metadata.Properties, options)
-	if eligibleProps.KeysLen() == 0 {
+	eligibleProps, _ := tc.eligibleProperties(metadata, options)
+	return propertyMatrixSuffixFromEligible(eligibleProps)
+}
+
+func propertyMatrixSuffixFromEligible(eligibleProps *artifactoryutils.Properties) string {
+	if eligibleProps == nil || eligibleProps.KeysLen() == 0 {
 		return ""
 	}
 	encoded := eligibleProps.ToEncodedString(false)
@@ -352,11 +427,30 @@ func isChecksumDeployHit(statusCode int) bool {
 }
 
 // Only a missing blob (404) falls through to a full-body PUT.
-// 409 means the target path exists with a different checksum; overwrite is not attempted.
+// D3: HTTP 409 on checksum-deploy means the target already has a different checksum at
+// this path — this is a hard failure; we do not overwrite.
 func isChecksumDeployMiss(statusCode int) bool {
 	return statusCode == http.StatusNotFound
 }
 
 func isSuccessfulDeployStatusCode(statusCode int) bool {
 	return statusCode == http.StatusOK || statusCode == http.StatusCreated || statusCode == http.StatusAccepted
+}
+
+// isPermanentHTTPStatus reports 4xx responses other than 429 as non-retryable.
+// The shared HTTP client already skips retries for these codes; this helper surfaces
+// that classification at the transfer-files call site.
+func isPermanentHTTPStatus(statusCode int) bool {
+	return statusCode >= 400 && statusCode < 500 && statusCode != http.StatusTooManyRequests
+}
+
+func permanentOrRetryableResponseError(resp *http.Response, body []byte, expectedStatusCodes ...int) error {
+	err := errorutils.CheckResponseStatusWithBody(resp, body, expectedStatusCodes...)
+	if err == nil {
+		return nil
+	}
+	if resp != nil && isPermanentHTTPStatus(resp.StatusCode) {
+		return fmt.Errorf("permanent target HTTP %d: %w", resp.StatusCode, err)
+	}
+	return err
 }
