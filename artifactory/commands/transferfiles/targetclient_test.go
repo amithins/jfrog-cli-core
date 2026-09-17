@@ -22,8 +22,20 @@ import (
 )
 
 const (
-	testTargetRepo = testSourceRepo
+	testTargetRepo             = testSourceRepo
+	canonicalUbuntuDescription = "The Ubuntu container image maintained by Canonical\n\n" +
+		"Ubuntu is a Debian-based Linux operating system that runs from the desktop to the cloud, " +
+		"to all your internet connected things.\n" +
+		"It is the world's most popular operating system across public clouds and OpenStack clouds.\n" +
+		"It is the number one platform for containers; from Docker to Kubernetes to LXD, " +
+		"Ubuntu can run your containers at scale.\n" +
+		"Fast, secure and simple, Ubuntu powers millions of PCs worldwide.\n"
 )
+
+func propertyMatrixSuffix(metadata *SourceFileMetadata, options TargetDeployOptions) string {
+	eligibleProps, _ := filterEligibleProperties(metadata.Properties, options)
+	return propertyMatrixSuffixFromEligible(eligibleProps)
+}
 
 func testTargetMetadata() *SourceFileMetadata {
 	return &SourceFileMetadata{
@@ -267,6 +279,152 @@ func TestTargetClient_ApplyProperties_omitsValuesLongerThan2400(t *testing.T) {
 	assert.NotContains(t, client.propertyMatrixSuffix(metadata, defaultTargetDeployOptions()), "long")
 }
 
+func TestPropertyMatrixSuffix_omitsPathUnsafeValues(t *testing.T) {
+	metadata := testTargetMetadata()
+	metadata.Properties = map[string][]string{
+		"docker.label.org.opencontainers.image.description": {
+			canonicalUbuntuDescription,
+		},
+		"note":      {"see docs#install"},
+		"docker.os": {"linux"},
+	}
+
+	suffix := propertyMatrixSuffix(metadata, defaultTargetDeployOptions())
+	assert.Empty(t, suffix, "one unsafe value routes the entire item through PATCH")
+	assert.NotContains(t, suffix, "docker.label.org.opencontainers.image.description")
+	assert.NotContains(t, suffix, "note=")
+	assert.NotContains(t, suffix, "%0A")
+}
+
+func Test_propertyDelivery_agreesForMatrixAndPatch(t *testing.T) {
+	tests := []struct {
+		name     string
+		props    map[string][]string
+		viaPatch bool
+	}{
+		{
+			name:     "path-safe short map uses matrix",
+			props:    map[string][]string{"docker.os": {"linux"}},
+			viaPatch: false,
+		},
+		{
+			name: "unsafe value forces PATCH",
+			props: map[string][]string{
+				"note":      {"docs#install"},
+				"docker.os": {"linux"},
+			},
+			viaPatch: true,
+		},
+		{
+			name:     "oversized encoded payload forces PATCH",
+			props:    largeEligiblePropertiesMap(t),
+			viaPatch: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eligible, _ := filterEligibleProperties(tt.props, TargetDeployOptions{})
+			viaPatch, encoded := propertyDelivery(eligible)
+			assert.Equal(t, tt.viaPatch, viaPatch)
+			suffix := propertyMatrixSuffixFromEligible(eligible)
+			if viaPatch {
+				assert.Empty(t, suffix)
+				assert.NotEmpty(t, encoded)
+				return
+			}
+			assert.Equal(t, ";"+encoded, suffix)
+		})
+	}
+}
+
+func Test_isPathUnsafePropertyValue(t *testing.T) {
+	tests := []struct {
+		name   string
+		value  string
+		unsafe bool
+	}{
+		{name: "newline", value: "first\nsecond", unsafe: true},
+		{name: "carriage return", value: "first\rsecond", unsafe: true},
+		{name: "hash", value: "docs#install", unsafe: true},
+		{name: "comma", value: "one,two", unsafe: true},
+		{name: "backslash", value: `one\two`, unsafe: true},
+		{name: "pipe", value: "one|two", unsafe: true},
+		{name: "safe", value: "letters numbers 123-_./:", unsafe: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.unsafe, isPathUnsafePropertyValue(test.value))
+		})
+	}
+}
+
+func TestTargetClient_ApplyProperties_patchesPathUnsafeValues(t *testing.T) {
+	metadata := testTargetMetadata()
+	metadata.Properties = map[string][]string{
+		"docker.label.org.opencontainers.image.description": {canonicalUbuntuDescription},
+		"docker.os": {"linux"},
+	}
+
+	var requestMethod string
+	var bodyBytes []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestMethod = r.Method
+		bodyBytes, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
+	require.NoError(t, err)
+
+	skippedLargeProps, err := client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
+	require.NoError(t, err)
+	assert.False(t, skippedLargeProps)
+	assert.Equal(t, http.MethodPatch, requestMethod)
+
+	var patchBody updateItemPropertiesBody
+	require.NoError(t, json.Unmarshal(bodyBytes, &patchBody))
+	assert.Equal(t, map[string][]string{
+		"docker.label.org.opencontainers.image.description": {canonicalUbuntuDescription},
+		"docker.os": {"linux"},
+	}, patchBody.Props)
+	assert.Empty(t, propertyMatrixSuffix(metadata, defaultTargetDeployOptions()))
+}
+
+func TestTargetClient_ApplyProperties_patchesPathUnsafeKeys(t *testing.T) {
+	metadata := testTargetMetadata()
+	metadata.Properties = map[string][]string{
+		"safe":       {"value"},
+		"unsafe|key": {"preserved"},
+	}
+
+	var requestMethod string
+	var requestPath string
+	var bodyBytes []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestMethod = r.Method
+		requestPath = r.URL.Path
+		bodyBytes, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
+	require.NoError(t, err)
+
+	skippedLargeProps, err := client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
+	require.NoError(t, err)
+	assert.False(t, skippedLargeProps)
+	assert.Equal(t, http.MethodPatch, requestMethod)
+	assert.Equal(t, "/api/metadata/"+testTargetRelativePath(), requestPath)
+	assert.Empty(t, propertyMatrixSuffix(metadata, defaultTargetDeployOptions()),
+		"unsafe property keys must not be encoded as deploy matrix parameters")
+
+	var patchBody updateItemPropertiesBody
+	require.NoError(t, json.Unmarshal(bodyBytes, &patchBody))
+	assert.Equal(t, metadata.Properties, patchBody.Props)
+}
+
 func TestTargetClient_ApplyProperties_usesPatchWhenEncodedPayloadExceeds4000(t *testing.T) {
 	metadata := testTargetMetadata()
 	metadata.Properties = largeEligiblePropertiesMap(t)
@@ -326,10 +484,12 @@ func TestTargetClient_ApplyProperties_usesPutQueryWhenEncodedPayloadAtMost4000(t
 	assert.Zero(t, requestCount)
 }
 
-func TestTargetClient_ApplyProperties_stripsGeneratedPropertyKeys(t *testing.T) {
+func TestTargetClient_ApplyProperties_stripsOnlyPackageGeneratedPropertyKeys(t *testing.T) {
 	metadata := testTargetMetadata()
 	metadata.Properties = map[string][]string{
 		"build.name":                   {"app"},
+		"npm.name":                     {"package"},
+		"npm.version":                  {"1.0.0"},
 		"artifactory.licenses":         {"MIT"},
 		"artifactory.metadata.exclude": {"*"},
 		"package.lowercase":            {"true"},
@@ -348,18 +508,19 @@ func TestTargetClient_ApplyProperties_stripsGeneratedPropertyKeys(t *testing.T) 
 	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
-	// ruby/baseUrl are only package-generated for their own package type (gems/pub); a
-	// generic repo's properties must pass through untouched.
-	suffix := client.propertyMatrixSuffix(metadata, defaultTargetDeployOptions())
+	options := defaultTargetDeployOptions()
+	options.PackageType = "npm"
+	suffix := client.propertyMatrixSuffix(metadata, options)
 	assert.Contains(t, suffix, "build.name=")
-	assert.NotContains(t, suffix, "artifactory.licenses")
+	assert.NotContains(t, suffix, "npm.name")
+	assert.NotContains(t, suffix, "npm.version")
 	assert.NotContains(t, suffix, "artifactory.metadata.exclude")
-	assert.NotContains(t, suffix, "package.lowercase")
-	assert.Contains(t, suffix, "ruby=")
-	assert.Contains(t, suffix, "baseUrl=")
-	assert.NotContains(t, suffix, "conan.settings.os")
+	assert.Contains(t, suffix, "artifactory.licenses")
+	assert.Contains(t, suffix, "package.lowercase")
+	assert.Contains(t, suffix, "baseUrl")
+	assert.Contains(t, suffix, "conan.settings.os")
 
-	skippedLargeProps, err := client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
+	skippedLargeProps, err := client.ApplyProperties(context.Background(), metadata, options)
 	require.NoError(t, err)
 	assert.False(t, skippedLargeProps)
 	assert.Zero(t, requestCount)
@@ -688,7 +849,7 @@ func TestTargetClient_ApplyStatistics_putsItemStatisticsXML(t *testing.T) {
 	metadata.DownloadCount = 5
 	metadata.LastDownloaded = 1788945284685
 	metadata.LastDownloadedBy = "admin"
-	err = client.ApplyStatistics(context.Background(), metadata)
+	err = client.ApplyStatistics(context.Background(), metadata, defaultTargetDeployOptions())
 	require.NoError(t, err)
 	assert.Equal(t, http.MethodPut, requestMethod)
 	assert.Equal(t, "/"+testTargetRelativePath()+":statistics", requestPath)
@@ -697,7 +858,6 @@ func TestTargetClient_ApplyStatistics_putsItemStatisticsXML(t *testing.T) {
 	assert.Contains(t, requestBody, "<downloadCount>5</downloadCount>")
 	assert.Contains(t, requestBody, "<lastDownloaded>1788945284685</lastDownloaded>")
 	assert.Contains(t, requestBody, "<lastDownloadedBy>admin</lastDownloadedBy>")
-	assert.NotContains(t, requestPath, "/api/plugins/execute/")
 }
 
 func TestTargetClient_ApplyStatistics_rejectedStatus_doesNotFail(t *testing.T) {
@@ -714,7 +874,7 @@ func TestTargetClient_ApplyStatistics_rejectedStatus_doesNotFail(t *testing.T) {
 	metadata := testTargetMetadata()
 	metadata.DownloadCount = 5
 	metadata.LastDownloadedBy = "admin"
-	err = client.ApplyStatistics(context.Background(), metadata)
+	err = client.ApplyStatistics(context.Background(), metadata, defaultTargetDeployOptions())
 	require.NoError(t, err)
 }
 
@@ -728,7 +888,7 @@ func TestTargetClient_ApplyStatistics_skipsWhenEmpty(t *testing.T) {
 	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
-	err = client.ApplyStatistics(context.Background(), testTargetMetadata())
+	err = client.ApplyStatistics(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
 	require.NoError(t, err)
 	assert.Zero(t, requestCount)
 }
@@ -748,7 +908,7 @@ func TestTargetClient_ApplyStatistics_skipsFolders(t *testing.T) {
 		Path:             "empty-dir",
 		DownloadCount:    3,
 		LastDownloadedBy: "admin",
-	})
+	}, defaultTargetDeployOptions())
 	require.NoError(t, err)
 	assert.Zero(t, requestCount)
 }
@@ -1084,4 +1244,55 @@ func Test_filterEligibleProperties_usesPackageType(t *testing.T) {
 	assert.False(t, skippedLargeProps)
 	assert.Equal(t, 1, eligibleProps.KeysLen())
 	assert.Equal(t, map[string][]string{"build.name": {"app"}}, eligibleProps.ToMap())
+}
+
+func testStatsMetadata() *SourceFileMetadata {
+	metadata := testTargetMetadata()
+	metadata.DownloadCount = 5
+	metadata.LastDownloaded = 1788945284685
+	metadata.LastDownloadedBy = "admin"
+	return metadata
+}
+
+func Test_skipsDownloadStatistics(t *testing.T) {
+	tests := []struct {
+		name    string
+		options TargetDeployOptions
+		want    bool
+	}{
+		{name: "generic", options: defaultTargetDeployOptions(), want: false},
+		{name: "distribution", options: TargetDeployOptions{PackageType: "distribution"}, want: false},
+		{name: "support", options: TargetDeployOptions{PackageType: "support"}, want: false},
+		{name: "releasebundles", options: TargetDeployOptions{PackageType: "releasebundles"}, want: false},
+		{name: "buildInfoRepoFlag", options: TargetDeployOptions{BuildInfoRepo: true}, want: true},
+		{name: "buildinfoPackageType", options: TargetDeployOptions{PackageType: "BuildInfo"}, want: true},
+		{name: "pipeinfoPackageType", options: TargetDeployOptions{PackageType: "PipeInfo"}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, skipsDownloadStatistics(tt.options))
+		})
+	}
+}
+
+func TestTargetClient_ApplyStatistics_skipsInfoRepos(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		requestCount++
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
+	require.NoError(t, err)
+
+	for _, options := range []TargetDeployOptions{
+		{BuildInfoRepo: true},
+		{PackageType: "buildinfo"},
+		{PackageType: "pipeinfo"},
+	} {
+		requestCount = 0
+		err = client.ApplyStatistics(context.Background(), testStatsMetadata(), options)
+		require.NoError(t, err)
+		assert.Zero(t, requestCount, "options=%+v", options)
+	}
 }

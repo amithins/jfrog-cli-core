@@ -20,7 +20,7 @@ type fileTransferTarget interface {
 	Put(ctx context.Context, metadata *SourceFileMetadata, reader io.Reader, options TargetDeployOptions) error
 	CreateFolder(ctx context.Context, metadata *SourceFileMetadata, options TargetDeployOptions) error
 	ApplyProperties(ctx context.Context, metadata *SourceFileMetadata, options TargetDeployOptions) (skippedLargeProps bool, err error)
-	ApplyStatistics(ctx context.Context, metadata *SourceFileMetadata) error
+	ApplyStatistics(ctx context.Context, metadata *SourceFileMetadata, options TargetDeployOptions) error
 	ReleaseEligibleProperties(metadata *SourceFileMetadata, options TargetDeployOptions)
 }
 
@@ -171,7 +171,7 @@ func (ft *FileTransfer) applyPropertiesAndStats(ctx context.Context, result Tran
 	if skippedLargeProps {
 		result.Status = api.SkippedLargeProps
 	}
-	err = ft.target.ApplyStatistics(ctx, metadata)
+	err = ft.target.ApplyStatistics(ctx, metadata, options.TargetDeployOptions)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return failAfterContentTransfer(result, errors.Join(err, ctxErr))
 	}

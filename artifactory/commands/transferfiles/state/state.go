@@ -63,6 +63,9 @@ func newRepositoryTransferState(repoKey string) TransferState {
 }
 
 func (ts *TransferState) Action(action ActionOnStateFunc) error {
+	saveStateMutex.Lock()
+	defer saveStateMutex.Unlock()
+
 	if err := action(ts); err != nil {
 		return err
 	}
@@ -71,11 +74,6 @@ func (ts *TransferState) Action(action ActionOnStateFunc) error {
 	if now.Sub(ts.lastSaveTimestamp).Seconds() < float64(stateAndStatusSaveIntervalSecs) {
 		return nil
 	}
-
-	if !saveStateMutex.TryLock() {
-		return nil
-	}
-	defer saveStateMutex.Unlock()
 
 	ts.lastSaveTimestamp = now
 	return ts.persistTransferState(false)
