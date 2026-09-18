@@ -348,18 +348,51 @@ func TestTargetClient_ApplyProperties_stripsGeneratedPropertyKeys(t *testing.T) 
 	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
 	require.NoError(t, err)
 
+	// ruby/baseUrl are only package-generated for their own package type (gems/pub); a
+	// generic repo's properties must pass through untouched.
 	suffix := client.propertyMatrixSuffix(metadata, defaultTargetDeployOptions())
 	assert.Contains(t, suffix, "build.name=")
 	assert.NotContains(t, suffix, "artifactory.licenses")
 	assert.NotContains(t, suffix, "artifactory.metadata.exclude")
 	assert.NotContains(t, suffix, "package.lowercase")
-	assert.NotContains(t, suffix, "baseUrl")
+	assert.Contains(t, suffix, "ruby=")
+	assert.Contains(t, suffix, "baseUrl=")
 	assert.NotContains(t, suffix, "conan.settings.os")
 
 	skippedLargeProps, err := client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
 	require.NoError(t, err)
 	assert.False(t, skippedLargeProps)
 	assert.Zero(t, requestCount)
+}
+
+func TestTargetClient_ApplyProperties_stripsPackageScopedGeneratedKeys(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+
+	gemsMetadata := testTargetMetadata()
+	gemsMetadata.Properties = map[string][]string{
+		"build.name": {"app"},
+		"ruby":       {"x86_64-linux"},
+	}
+	gemsOptions := defaultTargetDeployOptions()
+	gemsOptions.PackageType = "gems"
+	suffix := client.propertyMatrixSuffix(gemsMetadata, gemsOptions)
+	assert.Contains(t, suffix, "build.name=")
+	assert.NotContains(t, suffix, "ruby=")
+
+	pubMetadata := testTargetMetadata()
+	pubMetadata.Properties = map[string][]string{
+		"build.name": {"app"},
+		"baseUrl":    {"http://example.com"},
+	}
+	pubOptions := defaultTargetDeployOptions()
+	pubOptions.PackageType = "pub"
+	suffix = client.propertyMatrixSuffix(pubMetadata, pubOptions)
+	assert.Contains(t, suffix, "build.name=")
+	assert.NotContains(t, suffix, "baseUrl=")
 }
 
 func TestTargetClient_ApplyProperties_preservesMultiValues(t *testing.T) {
