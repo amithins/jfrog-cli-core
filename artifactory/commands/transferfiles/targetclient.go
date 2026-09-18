@@ -297,11 +297,9 @@ func (tc *TargetClient) ApplyProperties(ctx context.Context, metadata *SourceFil
 	}
 	eligibleProps, skippedLargeProps := tc.eligibleProperties(metadata, options)
 	defer tc.ReleaseEligibleProperties(metadata, options)
-	if eligibleProps.KeysLen() == 0 {
-		return skippedLargeProps, nil
-	}
-	if len(eligibleProps.ToEncodedString(false)) <= maxPropertyEncodedStringLength {
-		// Short property maps are applied as matrix params on checksum/full PUT.
+	viaPatch, _ := propertyDelivery(eligibleProps)
+	if !viaPatch {
+		// Short, path-safe maps are applied as matrix params on checksum/full PUT.
 		return skippedLargeProps, nil
 	}
 	relativePath := strings.TrimSuffix(targetRelativePath(metadata), "/")
@@ -326,11 +324,11 @@ func (tc *TargetClient) applyPropertiesViaPatch(ctx context.Context, relativePat
 	return permanentOrRetryableResponseError(resp, body, http.StatusNoContent)
 }
 
-func (tc *TargetClient) ApplyStatistics(ctx context.Context, metadata *SourceFileMetadata) error {
+func (tc *TargetClient) ApplyStatistics(ctx context.Context, metadata *SourceFileMetadata, options TargetDeployOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if metadata.Name == "" || !hasDownloadStatistics(metadata) {
+	if skipsDownloadStatistics(options) || metadata.Name == "" || !hasDownloadStatistics(metadata) {
 		return nil
 	}
 	relativePath := strings.TrimSuffix(targetRelativePath(metadata), "/")
@@ -398,6 +396,21 @@ func (tc *TargetClient) ReleaseEligibleProperties(metadata *SourceFileMetadata, 
 
 func hasDownloadStatistics(metadata *SourceFileMetadata) bool {
 	return metadata.DownloadCount > 0 || metadata.LastDownloaded > 0 || metadata.LastDownloadedBy != ""
+}
+
+// skipsDownloadStatistics matches Artifactory info repos (BuildInfo, PipeInfo). Those
+// stores ingest JSON metadata and reject PUT path:statistics with application/xml (415).
+// Distribution, Support, and ReleaseBundles accept statistics (lab 201) and are not skipped.
+func skipsDownloadStatistics(options TargetDeployOptions) bool {
+	if options.BuildInfoRepo {
+		return true
+	}
+	switch strings.ToLower(options.PackageType) {
+	case "buildinfo", "pipeinfo":
+		return true
+	default:
+		return false
+	}
 }
 
 func (tc *TargetClient) buildDeployURL(relativePath string) (string, error) {
@@ -499,6 +512,40 @@ func filterEligibleProperties(properties map[string][]string, options TargetDepl
 	return eligibleProps, skippedLargeProps
 }
 
+func isPathUnsafePropertyValue(value string) bool {
+	return strings.ContainsAny(value, "\n\r#,\\|")
+}
+
+func containsPathUnsafePropertyValue(properties *artifactoryutils.Properties) bool {
+	for key, values := range properties.ToMap() {
+		if isPathUnsafePropertyValue(key) {
+			return true
+		}
+		for _, value := range values {
+			if isPathUnsafePropertyValue(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// propertyDelivery is the single decision for matrix-param vs PATCH. Put,
+// checksum-deploy, and ApplyProperties must not re-derive these conditions.
+func propertyDelivery(eligibleProps *artifactoryutils.Properties) (viaPatch bool, encoded string) {
+	if eligibleProps == nil || eligibleProps.KeysLen() == 0 {
+		return false, ""
+	}
+	encoded = eligibleProps.ToEncodedString(false)
+	if encoded == "" {
+		return false, ""
+	}
+	if len(encoded) > maxPropertyEncodedStringLength || containsPathUnsafePropertyValue(eligibleProps) {
+		return true, encoded
+	}
+	return false, encoded
+}
+
 func (tc *TargetClient) propertyMatrixSuffix(metadata *SourceFileMetadata, options TargetDeployOptions) string {
 	if metadata == nil {
 		return ""
@@ -508,11 +555,8 @@ func (tc *TargetClient) propertyMatrixSuffix(metadata *SourceFileMetadata, optio
 }
 
 func propertyMatrixSuffixFromEligible(eligibleProps *artifactoryutils.Properties) string {
-	if eligibleProps == nil || eligibleProps.KeysLen() == 0 {
-		return ""
-	}
-	encoded := eligibleProps.ToEncodedString(false)
-	if encoded == "" || len(encoded) > maxPropertyEncodedStringLength {
+	viaPatch, encoded := propertyDelivery(eligibleProps)
+	if viaPatch || encoded == "" {
 		return ""
 	}
 	return ";" + encoded

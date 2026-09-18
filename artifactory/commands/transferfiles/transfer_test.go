@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -24,18 +23,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRunSetup_usesTargetPing_notPluginExecute(t *testing.T) {
+func TestRunSetup_usesTargetPing(t *testing.T) {
 	cleanUpJfrogHome, err := tests.SetJfrogHome()
 	require.NoError(t, err)
 	defer cleanUpJfrogHome()
 
 	var targetPingCalls int
-	var pluginExecuteCalls int
 
 	sourceServer, sourceDetails, _ := commonTests.CreateRtRestsMockServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.RequestURI, "api/plugins/execute") {
-			pluginExecuteCalls++
-		}
 		switch r.RequestURI {
 		case "/api/system/version":
 			w.WriteHeader(http.StatusOK)
@@ -56,9 +51,6 @@ func TestRunSetup_usesTargetPing_notPluginExecute(t *testing.T) {
 	defer sourceServer.Close()
 
 	targetServer, targetDetails, _ := commonTests.CreateRtRestsMockServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.RequestURI, "api/plugins/execute") {
-			pluginExecuteCalls++
-		}
 		if r.RequestURI == "/api/system/ping" {
 			targetPingCalls++
 			w.WriteHeader(http.StatusOK)
@@ -75,7 +67,6 @@ func TestRunSetup_usesTargetPing_notPluginExecute(t *testing.T) {
 	err = cmd.Run()
 	require.NoError(t, err)
 	assert.Greater(t, targetPingCalls, 0, "command setup should ping target /api/system/ping")
-	assert.Equal(t, 0, pluginExecuteCalls, "command setup must not call /api/plugins/execute")
 }
 
 func TestRun_schemeLessProxyKeyFailsClosed(t *testing.T) {

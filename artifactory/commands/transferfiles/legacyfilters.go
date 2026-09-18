@@ -2,30 +2,52 @@ package transferfiles
 
 import (
 	"strings"
+
+	"github.com/jfrog/gofrog/datastructures"
 )
 
-var packageTypePropertyPrefixes = map[string]string{
-	"go":        "go.",
-	"npm":       "npm.",
-	"pub":       "pub.",
-	"rpm":       "rpm.metadata.",
-	"chef":      "chef.",
-	"gems":      "gem.",
-	"helm":      "chart.",
-	"opkg":      "opkg.",
-	"pypi":      "pypi.",
-	"bower":     "bower.",
-	"cargo":     "crate.",
-	"conan":     "conan.",
-	"conda":     "conda.",
-	"nuget":     "nuget.",
-	"swift":     "swift.",
-	"alpine":    "alpine.",
-	"debian":    "deb.",
-	"puppet":    "puppet.",
-	"composer":  "composer.",
-	"cocoapods": "pods.",
-	"terraform": "terraform.",
+// packageTypeGeneratedProperties mirrors the exact property keys excluded by jfrog/data-transfer 1.7.6:
+// src/main/java/com/jfrog/filters/PathPropsFilter.java and its package-specific subclasses at
+// commit dbeeeaa95fd791fc929f579082ea1054e1cd5e0d. PathPropsFilter uses exact set membership;
+// only subclass overrides such as ConanFilter's conan.settings prefix are matched by prefix.
+var packageTypeGeneratedProperties = map[string]*datastructures.Set[string]{
+	"go": datastructures.MakeSetFromElements("go.name", "package.lowercase"),
+	"npm": datastructures.MakeSetFromElements("npm.name", "npm.version", "npm.description", "npm.keywords", "npm.deprecated",
+		"npm.detachedtags", "artifactory.metadata.exclude"),
+	"pub": datastructures.MakeSetFromElements("pub.name", "pub.version", "pub.description", "pub.homepage", "pub.repository",
+		"pub.dependencies", "pub.devdependencies", "pub.environment", "baseurl"),
+	"rpm": datastructures.MakeSetFromElements("rpm.metadata.name", "rpm.metadata.arch", "rpm.metadata.version", "rpm.metadata.license",
+		"rpm.metadata.release", "rpm.metadata.epoch", "rpm.metadata.group", "rpm.metadata.vendor", "rpm.metadata.summary"),
+	"chef": datastructures.MakeSetFromElements("chef.name", "chef.version", "chef.maintainer", "chef.description", "chef.external",
+		"chef.issues", "chef.dependencies", "chef.platforms", "artifactory.licenses"),
+	"gems": datastructures.MakeSetFromElements("gem.name", "gem.version", "gem.platform", "gem.runtime.dependencies", "ruby"),
+	"helm": datastructures.MakeSetFromElements("chart.name", "chart.version", "chart.appversion", "chart.description", "chart.home",
+		"chart.created", "chart.type", "chart.annotations", "chart.apiversion", "chart.isdeprecated",
+		"chart.sources", "chart.maintainers", "chart.dependencies"),
+	"opkg": datastructures.MakeSetFromElements("opkg.architecture", "opkg.name", "opkg.version", "opkg.maintainer", "opkg.priority",
+		"opkg.section", "opkg.website"),
+	"pypi":  datastructures.MakeSetFromElements("pypi.name", "pypi.normalized.name", "pypi.version", "pypi.summary", "pypi.requires.python"),
+	"bower": datastructures.MakeSetFromElements("bower.name", "bower.version", "bower.pkg"),
+	"cargo": datastructures.MakeSetFromElements("crate.name", "crate.version", "crate.description", "crate.keywords", "crate.categories",
+		"crate.dependencies", "crate.features"),
+	"conan": datastructures.MakeSetFromElements("conan.recipe_hash", "conan.requires", "conan.packages.author", "conan.packages.license",
+		"conan.packages.url"),
+	"conda": datastructures.MakeSetFromElements("conda.name", "conda.version", "conda.arch", "conda.platform", "artifactory.licenses"),
+	"nuget": datastructures.MakeSetFromElements("nuget.id", "nuget.version", "nuget.title", "nuget.authors", "nuget.summary",
+		"nuget.copyright", "nuget.releasenotes", "nuget.owners", "nuget.description", "nuget.requirelicenseacceptance",
+		"nuget.projecturl", "nuget.iconurl", "nuget.licenseurl", "nuget.tags", "nuget.language", "nuget.digest",
+		"nuget.dependency", "nuget.reference", "nuget.frameworks"),
+	"swift":  datastructures.MakeSetFromElements("swift.name", "swift.version"),
+	"alpine": datastructures.MakeSetFromElements("alpine.name", "alpine.version", "alpine.branch", "alpine.repository", "alpine.architecture"),
+	"debian": datastructures.MakeSetFromElements("deb.name", "deb.version", "deb.maintainer", "deb.priority", "deb.section", "deb.website",
+		"artifactory.licenses"),
+	"puppet": datastructures.MakeSetFromElements("puppet.name", "puppet.version", "puppet.description", "puppet.module_groups",
+		"puppet.supported", "puppet.license", "puppet.author", "puppet.tags", "puppet.dependencies"),
+	"composer": datastructures.MakeSetFromElements("composer.name", "composer.version", "composer.description", "composer.author",
+		"composer.type", "composer.dependencies", "composer.keywords", "composer.full.reindex", "artifactory.licenses"),
+	"cocoapods": datastructures.MakeSetFromElements("pods.name", "pods.version", "pods.git.org", "pods.git.repo", "pods.git.version"),
+	"terraform": datastructures.MakeSetFromElements("terraform.id", "terraform.namespace", "terraform.version", "terraform.name",
+		"terraform.provider", "terraform.flavor", "terraform.type"),
 }
 
 // isGeneratedPropertyKey reports whether a property key is package-generated and should be
@@ -33,22 +55,10 @@ var packageTypePropertyPrefixes = map[string]string{
 func isGeneratedPropertyKey(key, packageType string) bool {
 	normalizedKey := strings.ToLower(key)
 	normalizedPackageType := strings.ToLower(packageType)
-
-	switch normalizedKey {
-	case "artifactory.licenses", "artifactory.metadata.exclude", "package.lowercase":
-		return true
-	case "ruby":
-		return normalizedPackageType == "gems"
-	case "baseurl":
-		return normalizedPackageType == "pub"
-	}
-	if strings.HasPrefix(normalizedKey, "conan.settings.") {
+	if normalizedPackageType == "conan" && strings.HasPrefix(normalizedKey, "conan.settings.") {
 		return true
 	}
 
-	prefix, ok := packageTypePropertyPrefixes[normalizedPackageType]
-	if ok && prefix != "" && strings.HasPrefix(normalizedKey, prefix) {
-		return true
-	}
-	return false
+	generatedKeys := packageTypeGeneratedProperties[normalizedPackageType]
+	return generatedKeys != nil && generatedKeys.Exists(normalizedKey)
 }

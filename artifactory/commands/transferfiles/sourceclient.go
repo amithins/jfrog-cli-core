@@ -90,16 +90,16 @@ func (sc *SourceClient) GetFileMetadata(ctx context.Context, file api.FileRepres
 		return nil, err
 	}
 
-	// Folder-info responses carry no "size" field; treat that as size 0 rather than a parse failure.
+	// Folders have no Name (see the stats-fetch guard below) and their info response carries no
+	// "size" field at all, so skip parsing entirely rather than treating "" as a parse failure.
 	var size int64
-	if fileInfo.Size != "" {
-		var parseErr error
-		size, parseErr = strconv.ParseInt(fileInfo.Size, 10, 64)
-		if parseErr != nil {
+	if file.Name != "" {
+		size, err = strconv.ParseInt(fileInfo.Size, 10, 64)
+		if err != nil {
 			if file.Size > 0 {
 				size = file.Size
 			} else {
-				return nil, fmt.Errorf("failed to parse file size %q for %s: %w", fileInfo.Size, relativePath, parseErr)
+				return nil, fmt.Errorf("failed to parse file size %q for %s: %w", fileInfo.Size, relativePath, err)
 			}
 		}
 	}

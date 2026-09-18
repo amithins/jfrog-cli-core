@@ -58,6 +58,7 @@ type mockTransferTarget struct {
 	onApplyProps    func()
 	statsErr        error
 	statsCalls      int
+	statsOptions    []TargetDeployOptions
 	folderErr       error
 	folderCalls     int
 	releaseCalls    int
@@ -100,8 +101,9 @@ func (m *mockTransferTarget) ApplyProperties(_ context.Context, _ *SourceFileMet
 	return m.propsSkipped, m.propsErr
 }
 
-func (m *mockTransferTarget) ApplyStatistics(_ context.Context, _ *SourceFileMetadata) error {
+func (m *mockTransferTarget) ApplyStatistics(_ context.Context, _ *SourceFileMetadata, options TargetDeployOptions) error {
 	m.statsCalls++
+	m.statsOptions = append(m.statsOptions, options)
 	return m.statsErr
 }
 
@@ -414,7 +416,7 @@ func TestFileTransfer_configureOptions_isConcurrentSafe(t *testing.T) {
 	wg.Wait()
 }
 
-func TestFileTransfer_propertiesUsesTransferOptionsSnapshot(t *testing.T) {
+func TestFileTransfer_statisticsUsesTransferOptionsSnapshot(t *testing.T) {
 	initialOptions := FileTransferOptions{
 		TargetDeployOptions: TargetDeployOptions{PackageType: "generic"},
 	}
@@ -432,6 +434,7 @@ func TestFileTransfer_propertiesUsesTransferOptionsSnapshot(t *testing.T) {
 
 	require.NoError(t, result.Err)
 	require.Equal(t, []TargetDeployOptions{initialOptions.TargetDeployOptions}, target.propsOptions)
+	require.Equal(t, []TargetDeployOptions{initialOptions.TargetDeployOptions}, target.statsOptions)
 }
 
 func TestFileTransfer_canceledContextAfterGetReader_closesReader(t *testing.T) {
