@@ -78,6 +78,20 @@ func TestRunSetup_usesTargetPing_notPluginExecute(t *testing.T) {
 	assert.Equal(t, 0, pluginExecuteCalls, "command setup must not call /api/plugins/execute")
 }
 
+func TestRun_schemeLessProxyKeyFailsClosed(t *testing.T) {
+	cmd, err := NewTransferFilesCommand(nil, nil)
+	require.NoError(t, err)
+	cmd.SetProxyKey("source-to-target")
+
+	err = cmd.Run()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"source-to-target"`)
+	assert.Contains(t, err.Error(), "full HTTP or HTTPS proxy URL including scheme")
+	assert.Contains(t, err.Error(), "http://proxy:3128")
+	assert.Contains(t, err.Error(), "HTTPS_PROXY")
+	assert.Contains(t, err.Error(), "NO_PROXY")
+}
+
 func TestHandleStopInitAndClose(t *testing.T) {
 	transferFilesCommand, err := NewTransferFilesCommand(nil, nil)
 	assert.NoError(t, err)

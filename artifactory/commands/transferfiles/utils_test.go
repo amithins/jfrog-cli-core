@@ -175,11 +175,11 @@ func TestUpdateMaxUniqueSnapshots(t *testing.T) {
 		t.Run(packageType, func(t *testing.T) {
 			lowerPackageType := strings.ToLower(packageType)
 			repoSummary := &utils.RepositorySummary{RepoKey: lowerPackageType + "-local", PackageType: packageType, RepoType: "LOCAL"}
-			err := updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5)
+			err := updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5, nil)
 			assert.NoError(t, err)
 
 			repoSummary = &utils.RepositorySummary{RepoKey: lowerPackageType + "-federated", PackageType: packageType, RepoType: "FEDERATED"}
-			err = updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5)
+			err = updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5, nil)
 			assert.NoError(t, err)
 		})
 	}
@@ -298,16 +298,16 @@ func TestUpdateThreads_updatesReportedWorkingThreads(t *testing.T) {
 func TestTransferServiceManagers_useOperationSpecificRetryBudgets(t *testing.T) {
 	details := newTestTargetServerDetails("http://127.0.0.1:1")
 
-	sharedManager, err := createTransferServiceManager(context.Background(), details)
+	sharedManager, err := createTransferServiceManager(context.Background(), details, nil)
 	require.NoError(t, err)
 	assert.Equal(t, retries, sharedManager.GetConfig().GetHttpRetries())
 
-	metadataManager, err := createMetadataTransferServiceManager(context.Background(), details)
+	metadataManager, err := createMetadataTransferServiceManager(context.Background(), details, nil)
 	require.NoError(t, err)
 	assert.Equal(t, metadataTransferRetries, metadataManager.GetConfig().GetHttpRetries())
 	assert.LessOrEqual(t, metadataManager.GetConfig().GetHttpRetries(), 5)
 
-	streamManager, err := createStreamingTransferServiceManager(context.Background(), details)
+	streamManager, err := createStreamingTransferServiceManager(context.Background(), details, nil)
 	require.NoError(t, err)
 	assert.Zero(t, streamManager.GetConfig().GetHttpRetries())
 }
