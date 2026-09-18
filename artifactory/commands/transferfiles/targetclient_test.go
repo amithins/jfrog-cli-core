@@ -989,6 +989,61 @@ func TestTargetClient_Put_classifiesRetryableStatus(t *testing.T) {
 	assert.Contains(t, err.Error(), "slow down")
 }
 
+func TestTargetClient_Put_ctxCancelAbortsInFlightRequest(t *testing.T) {
+	unblock := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+	defer close(unblock)
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	err = client.Put(ctx, testTargetMetadata(), strings.NewReader("hello world"), defaultTargetDeployOptions())
+	elapsed := time.Since(start)
+	require.Error(t, err)
+	assert.Less(t, elapsed, 2*time.Second,
+		"Put must be bound to the per-call ctx and abort mid-flight on cancellation, not block until the (never-responding) server replies")
+}
+
+func TestTargetClient_ApplyProperties_ctxCancelAbortsInFlightPatch(t *testing.T) {
+	unblock := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblock
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	defer close(unblock)
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+
+	metadata := testTargetMetadata()
+	metadata.Properties = largeEligiblePropertiesMap(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err = client.ApplyProperties(ctx, metadata, defaultTargetDeployOptions())
+	elapsed := time.Since(start)
+	require.Error(t, err)
+	assert.Less(t, elapsed, 2*time.Second,
+		"ApplyProperties' PATCH must be bound to the per-call ctx and abort mid-flight on cancellation")
+}
+
 func TestTargetClient_CreateFolder_errorReleasesEligibleProperties(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusForbidden)

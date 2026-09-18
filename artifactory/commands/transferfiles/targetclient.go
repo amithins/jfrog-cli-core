@@ -1,6 +1,7 @@
 package transferfiles
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
@@ -99,6 +100,99 @@ func NewTargetClient(ctx context.Context, serverDetails *config.ServerDetails) (
 	}, nil
 }
 
+// doManagerRequest sends a fixed-content request bound to ctx (so a per-call ctx cancellation
+// actually aborts the in-flight request, unlike the service manager's own long-lived,
+// construction-time context) and retries retryable statuses using the manager's configured
+// retry budget. content may be nil for a bodyless request; it is safe to resend on retry since
+// it isn't consumed like a streaming reader.
+func doManagerRequest(ctx context.Context, manager artifactory.ArtifactoryServicesManager, method, fullURL string, content []byte, httpClientsDetails httputils.HttpClientDetails) (*http.Response, []byte, error) {
+	httpCli := manager.Client().GetHttpClient()
+	cfg := manager.GetConfig()
+
+	var resp *http.Response
+	var body []byte
+	retryExecutor := clientutils.RetryExecutor{
+		Context:                  ctx,
+		MaxRetries:               cfg.GetHttpRetries(),
+		RetriesIntervalMilliSecs: cfg.GetHttpRetryWaitMilliSecs(),
+		ErrorMessage:             fmt.Sprintf("Failure occurred while sending %s request to %s", method, fullURL),
+		ExecutionHandler: func() (bool, error) {
+			var bodyReader io.Reader
+			if content != nil {
+				bodyReader = bytes.NewReader(content)
+			}
+			req, reqErr := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
+			if reqErr != nil {
+				return !isContextDoneError(ctx, reqErr), reqErr
+			}
+			if content != nil {
+				req.ContentLength = int64(len(content))
+			}
+			applyHttpClientDetails(req, httpClientsDetails)
+			var doErr error
+			resp, doErr = httpCli.GetClient().Do(req)
+			if doErr != nil {
+				if isContextDoneError(ctx, doErr) {
+					return false, doErr
+				}
+				return true, doErr
+			}
+			if resp == nil {
+				return false, errorutils.CheckErrorf("received empty response from target server")
+			}
+			if shouldRetryHTTPStatus(resp.StatusCode) {
+				drainAndClose(resp.Body)
+				return true, nil
+			}
+			defer drainAndClose(resp.Body)
+			var readErr error
+			body, readErr = io.ReadAll(resp.Body)
+			if readErr != nil {
+				return false, readErr
+			}
+			return false, nil
+		},
+	}
+	err := retryExecutor.Execute()
+	return resp, body, err
+}
+
+func doManagerPut(ctx context.Context, manager artifactory.ArtifactoryServicesManager, fullURL string, content []byte, httpClientsDetails httputils.HttpClientDetails) (*http.Response, []byte, error) {
+	return doManagerRequest(ctx, manager, http.MethodPut, fullURL, content, httpClientsDetails)
+}
+
+func doManagerPatch(ctx context.Context, manager artifactory.ArtifactoryServicesManager, fullURL string, content []byte, httpClientsDetails httputils.HttpClientDetails) (*http.Response, []byte, error) {
+	return doManagerRequest(ctx, manager, http.MethodPatch, fullURL, content, httpClientsDetails)
+}
+
+// doManagerPutStream sends a single-attempt streaming PUT bound to ctx. Unlike doManagerPut, it
+// never retries: reader is typically the read side of an io.Pipe fed once from a source GET, and
+// can't be rewound for a second attempt.
+func doManagerPutStream(ctx context.Context, manager artifactory.ArtifactoryServicesManager, fullURL string, reader io.Reader, size int64, httpClientsDetails httputils.HttpClientDetails) (*http.Response, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, fullURL, reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.ContentLength = size
+	applyHttpClientDetails(req, httpClientsDetails)
+	resp, err := manager.Client().GetHttpClient().GetClient().Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	if resp == nil {
+		return nil, nil, nil
+	}
+	defer drainAndClose(resp.Body)
+	if isSuccessfulDeployStatusCode(resp.StatusCode) {
+		return resp, nil, nil
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp, nil, err
+	}
+	return resp, body, nil
+}
+
 func (tc *TargetClient) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -122,7 +216,7 @@ func (tc *TargetClient) TryChecksumDeploy(ctx context.Context, metadata *SourceF
 	deployURL += propertyMatrixSuffixFromEligible(eligibleProps)
 	httpClientsDetails := tc.metadataServiceManager.GetConfig().GetServiceDetails().CreateHttpClientDetails()
 	addDeployHeaders(&httpClientsDetails, tc.metadataServiceManager.GetConfig().GetServiceDetails(), metadata, options, true)
-	resp, body, err := tc.metadataServiceManager.Client().SendPut(deployURL, nil, &httpClientsDetails)
+	resp, body, err := doManagerPut(ctx, tc.metadataServiceManager, deployURL, nil, httpClientsDetails)
 	if err != nil {
 		tc.ReleaseEligibleProperties(metadata, options)
 		return ChecksumDeployMiss, err
@@ -154,30 +248,22 @@ func (tc *TargetClient) Put(ctx context.Context, metadata *SourceFileMetadata, r
 	addDeployHeaders(&httpClientsDetails, tc.streamServiceManager.GetConfig().GetServiceDetails(), metadata, options, false)
 	// Skip artifactoryutils.UploadFileFromReader: it always AddChecksumHeaders including
 	// X-Checksum-Md5 (even when Md5 is empty). Plain PUT must omit that header; it is
-	// reserved for CheckExistenceInFilestore checksum-deploy.
-	resp, body, err := tc.streamServiceManager.Client().UploadFileFromReader(reader, deployURL, &httpClientsDetails, metadata.Size)
-	if resp == nil {
-		// Transport-level failure: no status code to classify against.
+	// reserved for CheckExistenceInFilestore checksum-deploy. Use doManagerPutStream instead of
+	// SendPut/UploadFileFromReader so the request is bound to this call's ctx (not just the
+	// service manager's construction-time context) and can actually be aborted mid-flight.
+	resp, body, err := doManagerPutStream(ctx, tc.streamServiceManager, deployURL, reader, metadata.Size, httpClientsDetails)
+	if err != nil {
 		tc.ReleaseEligibleProperties(metadata, options)
-		if err != nil {
-			return err
-		}
+		return err
+	}
+	if resp == nil {
+		tc.ReleaseEligibleProperties(metadata, options)
 		return errorutils.CheckErrorf("received empty response from target deploy")
 	}
 	if isSuccessfulDeployStatusCode(resp.StatusCode) {
 		return nil
 	}
 	tc.ReleaseEligibleProperties(metadata, options)
-	// UploadFileFromReader returns as soon as the status check fails, without reading the
-	// body into the body return value, but err (from errorutils.CheckResponseStatus) already
-	// carries the body text read off resp.Body. Reuse it instead of re-deriving from a nil
-	// body, but still apply the permanent/retryable classification.
-	if err != nil {
-		if isPermanentHTTPStatus(resp.StatusCode) {
-			return fmt.Errorf("permanent target HTTP %d: %w", resp.StatusCode, err)
-		}
-		return err
-	}
 	return permanentOrRetryableResponseError(resp, body, http.StatusOK, http.StatusCreated, http.StatusAccepted)
 }
 
@@ -193,7 +279,7 @@ func (tc *TargetClient) CreateFolder(ctx context.Context, metadata *SourceFileMe
 	deployURL += propertyMatrixSuffixFromEligible(eligibleProps)
 	httpClientsDetails := tc.metadataServiceManager.GetConfig().GetServiceDetails().CreateHttpClientDetails()
 	addIdentityHeaders(&httpClientsDetails, metadata)
-	resp, body, err := tc.metadataServiceManager.Client().SendPut(deployURL, nil, &httpClientsDetails)
+	resp, body, err := doManagerPut(ctx, tc.metadataServiceManager, deployURL, nil, httpClientsDetails)
 	if err != nil {
 		tc.ReleaseEligibleProperties(metadata, options)
 		return err
@@ -219,10 +305,10 @@ func (tc *TargetClient) ApplyProperties(ctx context.Context, metadata *SourceFil
 		return skippedLargeProps, nil
 	}
 	relativePath := strings.TrimSuffix(targetRelativePath(metadata), "/")
-	return skippedLargeProps, tc.applyPropertiesViaPatch(relativePath, eligibleProps)
+	return skippedLargeProps, tc.applyPropertiesViaPatch(ctx, relativePath, eligibleProps)
 }
 
-func (tc *TargetClient) applyPropertiesViaPatch(relativePath string, eligibleProps *artifactoryutils.Properties) error {
+func (tc *TargetClient) applyPropertiesViaPatch(ctx context.Context, relativePath string, eligibleProps *artifactoryutils.Properties) error {
 	setPropertiesURL, err := clientutils.BuildUrl(tc.metadataServiceManager.GetConfig().GetServiceDetails().GetUrl(), path.Join("api", "metadata", relativePath), map[string]string{})
 	if err != nil {
 		return err
@@ -233,7 +319,7 @@ func (tc *TargetClient) applyPropertiesViaPatch(relativePath string, eligiblePro
 	}
 	httpClientsDetails := tc.metadataServiceManager.GetConfig().GetServiceDetails().CreateHttpClientDetails()
 	httpClientsDetails.SetContentTypeApplicationJson()
-	resp, body, err := tc.metadataServiceManager.Client().SendPatch(setPropertiesURL, requestBody, &httpClientsDetails)
+	resp, body, err := doManagerPatch(ctx, tc.metadataServiceManager, setPropertiesURL, requestBody, httpClientsDetails)
 	if err != nil {
 		return err
 	}
@@ -264,7 +350,7 @@ func (tc *TargetClient) ApplyStatistics(ctx context.Context, metadata *SourceFil
 	}
 	httpClientsDetails := tc.metadataServiceManager.GetConfig().GetServiceDetails().CreateHttpClientDetails()
 	httpClientsDetails.AddHeader("Content-Type", "application/xml")
-	resp, body, err := tc.metadataServiceManager.Client().SendPut(deployURL+itemStatisticsSuffix, statsXML, &httpClientsDetails)
+	resp, body, err := doManagerPut(ctx, tc.metadataServiceManager, deployURL+itemStatisticsSuffix, statsXML, httpClientsDetails)
 	if err != nil {
 		log.Warn("Couldn't set stats for", relativePath+". Reason:", err.Error())
 		return nil
