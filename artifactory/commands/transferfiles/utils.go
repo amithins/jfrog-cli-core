@@ -383,8 +383,12 @@ func handleTransferFileResult(phaseBase *phaseBase, result TransferResult, error
 	}
 	if statusMovesNoBytes(result.Status) {
 		if phaseBase.stateManager != nil {
+			chunk := api.ChunkStatus{Files: []api.FileUploadStatusResponse{fileStatus}}
 			withTransferFileResultLock(func() {
-				if err := setChunkCompletedInRepoSnapshot(phaseBase.stateManager, []api.FileUploadStatusResponse{fileStatus}); err != nil {
+				if err := state.UpdateChunkInState(phaseBase.stateManager, &chunk); err != nil {
+					log.Error(err)
+				}
+				if err := setChunkCompletedInRepoSnapshot(phaseBase.stateManager, chunk.Files); err != nil {
 					log.Error(err)
 				}
 			})

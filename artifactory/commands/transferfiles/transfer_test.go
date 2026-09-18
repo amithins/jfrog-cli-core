@@ -272,6 +272,45 @@ func TestUploadChunkAndPollUploads(t *testing.T) {
 	assert.Equal(t, 2, totalChunkStatusVisits)
 }
 
+// Reproduces the regression where pollUploads reset WorkingThreads to 0 on every loop iteration,
+// which zeroed out TimeEstimationManager's speed-samples window and left speed/ETA "Not available" for the whole run.
+func TestUploadChunkAndPollUploads_workingThreadsSurviveForSpeedEstimation(t *testing.T) {
+	stateManager, cleanUp := state.InitStateTest(t)
+	defer cleanUp()
+
+	totalChunkStatusVisits := 0
+	totalUploadChunkVisits := 0
+	fileSample := api.FileRepresentation{
+		Repo: repo1Key,
+		Path: "rel-path",
+		Name: "name-demo",
+	}
+
+	testServer, serverDetails, _ := initPollUploadsTestMockServer(t, &totalChunkStatusVisits, &totalUploadChunkVisits, fileSample)
+	defer testServer.Close()
+	srcPluginManager := initSrcUserPluginServiceManager(t, serverDetails)
+
+	assert.NoError(t, stateManager.SetRepoState(repo1Key, 0, 0, false, true))
+	phaseBase := &phaseBase{context: context.Background(), stateManager: stateManager, srcUpService: srcPluginManager, repoKey: repo1Key}
+	uploadChunkAndPollTwice(t, phaseBase, fileSample)
+
+	// pollUploads should have reported the live number of in-flight chunks as the working threads count,
+	// not reset it to 0.
+	workingThreads, err := stateManager.GetWorkingThreads()
+	assert.NoError(t, err)
+	assert.NotZero(t, workingThreads)
+
+	// With a non-zero working threads count in place, a chunk completion should now produce a usable speed sample.
+	chunkStatus := api.ChunkStatus{
+		Files: []api.FileUploadStatusResponse{
+			{FileRepresentation: fileSample, SizeBytes: 10 * artifactoryUtils.SizeMiB, Status: api.Success},
+		},
+	}
+	assert.NoError(t, stateManager.TimeEstimationManager.AddChunkStatus(chunkStatus, 1000))
+	assert.NotEmpty(t, stateManager.TimeEstimationManager.LastSpeeds)
+	assert.NotEqual(t, "Not available yet", stateManager.TimeEstimationManager.GetSpeedString())
+}
+
 // Sends chunk to upload, polls on chunk three times - once when it is still in progress, once after done received and once to notify back to the source.
 func uploadChunkAndPollTwice(t *testing.T, phaseBase *phaseBase, fileSample api.FileRepresentation) {
 	curChunkUploaderThreads = coreUtils.DefaultThreads

@@ -84,9 +84,10 @@ func (ts *TransferRunStatus) persistTransferRunStatus() (err error) {
 	}
 
 	ts.Version = transferRunStatusVersion
-	// Lock order: saveRunStatusMutex (held by action) -> workingThreadsMutex ->
-	// timeEstimationMutex. Time-estimation code must not call back into
-	// TransferRunStatus.action while locked.
+	// persistTransferRunStatus only runs after action()'s callback has already returned and
+	// saveRunStatusMutex has been acquired (see action() above), so a callback such as
+	// SetWorkingThreads never holds workingThreadsMutex at the same time as saveRunStatusMutex.
+	// Lock order here is saveRunStatusMutex -> workingThreadsMutex -> timeEstimationMutex.
 	content, err := func() ([]byte, error) {
 		workingThreadsMutex.RLock()
 		defer workingThreadsMutex.RUnlock()

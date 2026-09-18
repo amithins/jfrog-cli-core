@@ -115,14 +115,18 @@ func TestHandleTransferFileResult_successUpdatesStateAndTimeEstimation(t *testin
 func TestHandleTransferFileResult_noByteSkipDoesNotUpdateTransferredBytesOrSpeed(t *testing.T) {
 	const candidateSize = int64(1024)
 	testCases := []struct {
-		name          string
-		status        api.ChunkFileStatusType
-		fileSize      int64
-		candidateName string
+		name                 string
+		status               api.ChunkFileStatusType
+		fileSize             int64
+		candidateName        string
+		wantTransferredUnits int64
 	}{
-		{name: "source item gone", status: api.SkippedSourceItemGone, fileSize: 0, candidateName: "gone.jar"},
-		{name: "metadata file", status: api.SkippedMetadataFile, fileSize: candidateSize, candidateName: "metadata.xml"},
-		{name: "non-empty directory", status: api.SkippedNonEmptyDir, fileSize: candidateSize, candidateName: ""},
+		// Named skips still count as a completed unit (matching the chunk-status polling path),
+		// so that --status can reach 100% even when metadata files or gone source items are skipped.
+		{name: "source item gone", status: api.SkippedSourceItemGone, fileSize: 0, candidateName: "gone.jar", wantTransferredUnits: 1},
+		{name: "metadata file", status: api.SkippedMetadataFile, fileSize: candidateSize, candidateName: "metadata.xml", wantTransferredUnits: 1},
+		// Directories carry no name, so they're excluded from the unit count, just like UpdateChunkInState does elsewhere.
+		{name: "non-empty directory", status: api.SkippedNonEmptyDir, fileSize: candidateSize, candidateName: "", wantTransferredUnits: 0},
 	}
 
 	for _, testCase := range testCases {
@@ -130,7 +134,11 @@ func TestHandleTransferFileResult_noByteSkipDoesNotUpdateTransferredBytesOrSpeed
 			stateManager, cleanUp := state.InitStateTest(t)
 			defer cleanUp()
 
-			assert.NoError(t, stateManager.SetRepoState("test-repo", 0, 0, false, true))
+			// TotalUnits is set to the expected transferred units, mirroring a repo made up
+			// entirely of files like this one, so we can assert that --status can still reach
+			// 100% for repos with metadata files or gone source items (RTDEV: skipped files
+			// were not incrementing TransferredUnits, leaving --status stuck below 100%).
+			assert.NoError(t, stateManager.SetRepoState("test-repo", 0, testCase.wantTransferredUnits, false, true))
 			assert.NoError(t, stateManager.SetWorkingThreads(1))
 
 			phaseBase := &phaseBase{stateManager: stateManager}
@@ -144,7 +152,8 @@ func TestHandleTransferFileResult_noByteSkipDoesNotUpdateTransferredBytesOrSpeed
 
 			assert.NoError(t, handleTransferFileResult(phaseBase, result, &errorsChannelMng))
 			assert.Zero(t, stateManager.CurrentRepo.Phase1Info.TransferredSizeBytes)
-			assert.Zero(t, stateManager.CurrentRepo.Phase1Info.TransferredUnits)
+			assert.Equal(t, testCase.wantTransferredUnits, stateManager.CurrentRepo.Phase1Info.TransferredUnits)
+			assert.Equal(t, stateManager.CurrentRepo.Phase1Info.TotalUnits, stateManager.CurrentRepo.Phase1Info.TransferredUnits)
 			assert.Zero(t, stateManager.TimeEstimationManager.CurrentTotalTransferredBytes)
 			assert.Empty(t, stateManager.TimeEstimationManager.LastSpeeds)
 		})

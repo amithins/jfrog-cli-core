@@ -759,6 +759,11 @@ func (tdc *TransferFilesCommand) initCurThreads(buildInfoRepo bool) error {
 			log.Info("Build info transferring - using reduced number of threads")
 		}
 	}
+	if tdc.stateManager != nil {
+		if err = tdc.stateManager.SetWorkingThreads(curChunkUploaderThreads); err != nil {
+			return err
+		}
+	}
 
 	log.Info("Running with maximum", strconv.Itoa(curChunkUploaderThreads), "working threads...")
 	return nil

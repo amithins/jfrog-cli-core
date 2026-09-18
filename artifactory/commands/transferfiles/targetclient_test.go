@@ -865,12 +865,12 @@ func TestTargetClient_TryChecksumDeploy_retryableStatusUsesMetadataRetryPolicy(t
 // TestNewTargetClient_metadataServiceManagerUsesProductionRetryPolicy complements
 // TestTargetClient_TryChecksumDeploy_retryableStatusUsesMetadataRetryPolicy, which swaps in a
 // manager with a small retry count to keep the test fast. This asserts the manager NewTargetClient
-// actually builds (without any override) carries the real production retry budget.
+// actually builds (without any override) carries the dedicated metadata retry budget.
 func TestNewTargetClient_metadataServiceManagerUsesProductionRetryPolicy(t *testing.T) {
 	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails("http://127.0.0.1:0"))
 	require.NoError(t, err)
-	assert.Equal(t, retries, client.metadataServiceManager.GetConfig().GetHttpRetries())
-	assert.Equal(t, retriesWaitMilliSecs, client.metadataServiceManager.GetConfig().GetHttpRetryWaitMilliSecs())
+	assert.Equal(t, metadataTransferRetries, client.metadataServiceManager.GetConfig().GetHttpRetries())
+	assert.Equal(t, metadataRetryWaitMilliSecs, client.metadataServiceManager.GetConfig().GetHttpRetryWaitMilliSecs())
 }
 
 func TestTargetClient_eligiblePropertiesComputedOnceAcrossFileAndFolderOperations(t *testing.T) {

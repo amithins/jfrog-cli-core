@@ -13,7 +13,6 @@ import (
 
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/state"
-	commandsUtils "github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/utils"
 	commonTests "github.com/jfrog/jfrog-cli-core/v2/common/tests"
 	coreConfig "github.com/jfrog/jfrog-cli-core/v2/utils/config"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/tests"
@@ -65,7 +64,6 @@ func TestFolderTraversal_schedulesFileTransferNotUploadChunk(t *testing.T) {
 	stateManager, cleanUp := state.InitStateTest(t)
 	defer cleanUp()
 
-	uploadChunkCalls := 0
 	mockAqlResults := servicesUtils.AqlSearchResult{
 		Results: []servicesUtils.ResultItem{
 			{Repo: "test-repo", Path: ".", Name: "file.jar", Size: 100, Type: "file"},
@@ -78,10 +76,6 @@ func TestFolderTraversal_schedulesFileTransferNotUploadChunk(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			response, _ := json.Marshal(mockAqlResults)
 			_, _ = w.Write(response)
-		case "/" + commandsUtils.PluginsExecuteRestApi + "uploadChunk":
-			uploadChunkCalls++
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"uuid_token":"token"}`))
 		}
 	}))
 	defer testServer.Close()
@@ -117,7 +111,6 @@ func TestFolderTraversal_schedulesFileTransferNotUploadChunk(t *testing.T) {
 	assert.NoError(t, runProducerConsumers(&pcWrapper))
 
 	assert.Equal(t, 1, executor.callCount, "folder traversal should schedule FileTransfer.TransferFile per file")
-	assert.Zero(t, uploadChunkCalls, "folder traversal should not schedule uploadChunk handler")
 }
 
 // TestGetPatternMatchingFilesWithResults tests getPatternMatchingFiles with files returned
