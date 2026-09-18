@@ -90,12 +90,22 @@ func (sc *SourceClient) GetFileMetadata(ctx context.Context, file api.FileRepres
 		return nil, err
 	}
 
-	size, parseErr := strconv.ParseInt(fileInfo.Size, 10, 64)
-	if parseErr != nil {
+	// Folder-info responses carry no "size" field; treat that as size 0 rather than a parse failure.
+	// Fall back to the AQL-reported size when it's available.
+	var size int64
+	if fileInfo.Size == "" {
 		if file.Size > 0 {
 			size = file.Size
-		} else {
-			return nil, fmt.Errorf("failed to parse file size %q for %s: %w", fileInfo.Size, relativePath, parseErr)
+		}
+	} else {
+		var parseErr error
+		size, parseErr = strconv.ParseInt(fileInfo.Size, 10, 64)
+		if parseErr != nil {
+			if file.Size > 0 {
+				size = file.Size
+			} else {
+				return nil, fmt.Errorf("failed to parse file size %q for %s: %w", fileInfo.Size, relativePath, parseErr)
+			}
 		}
 	}
 
@@ -222,6 +232,9 @@ func doManagerGet(ctx context.Context, manager artifactory.ArtifactoryServicesMa
 
 	var resp *http.Response
 	var body []byte
+	// RetryExecutor sleeps between attempts with a plain time.Sleep and only checks ctx
+	// between attempts, so cancellation can lag by up to one retry interval. Same behavior
+	// as other client-go callers of RetryExecutor.
 	retryExecutor := clientutils.RetryExecutor{
 		Context:                  ctx,
 		MaxRetries:               cfg.GetHttpRetries(),
@@ -264,6 +277,7 @@ func doManagerGet(ctx context.Context, manager artifactory.ArtifactoryServicesMa
 }
 
 func applyHttpClientDetails(req *http.Request, details httputils.HttpClientDetails) {
+	req.Header.Set("User-Agent", clientutils.GetUserAgent())
 	if details.ApiKey != "" {
 		if details.User != "" {
 			req.SetBasicAuth(details.User, details.ApiKey)
@@ -338,12 +352,10 @@ func (sc *SourceClient) GetFileReader(ctx context.Context, file api.FileRepresen
 }
 
 func fileRelativePath(file api.FileRepresentation) string {
-	if file.Path == "." {
-		return path.Join(file.Repo, file.Name)
-	}
 	return path.Join(file.Repo, file.Path, file.Name)
 }
 
+//nolint:unused // consumed by the streaming-download slice stacked on top of this PR
 func closeReadCloser(rc io.ReadCloser) {
 	if rc != nil {
 		_ = rc.Close()

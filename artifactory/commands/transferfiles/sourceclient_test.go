@@ -81,7 +81,8 @@ func TestGetFileMetadata_success(t *testing.T) {
 				"lastDownloadedBy": "",
 			}))
 		default:
-			t.Fatalf("unexpected request: %s", r.URL.String())
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
 		}
 	}))
 	defer server.Close()
@@ -136,7 +137,8 @@ func TestGetFileMetadata_includesDownloadStats(t *testing.T) {
 				"lastDownloadedBy": "admin",
 			}))
 		default:
-			t.Fatalf("unexpected request: %s", r.URL.String())
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
 		}
 	}))
 	defer server.Close()
@@ -170,7 +172,8 @@ func TestGetFileMetadata_statsNotFound_continuesWithoutStats(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"errors":[{"message":"Unable to find item"}]}`))
 		default:
-			t.Fatalf("unexpected request: %s", r.URL.String())
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
 		}
 	}))
 	defer server.Close()
@@ -203,7 +206,8 @@ func TestGetFileMetadata_statsForbidden_continuesWithoutStats(t *testing.T) {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`{"errors":[{"message":"Forbidden"}]}`))
 		default:
-			t.Fatalf("unexpected request: %s", r.URL.String())
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
 		}
 	}))
 	defer server.Close()
@@ -294,7 +298,8 @@ func TestGetFileMetadata_propertiesNotFoundOtherBody_itemGone(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"errors":[{"message":"Not found"}]}`))
 		default:
-			t.Fatalf("unexpected request: %s", r.URL.String())
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
 		}
 	}))
 	defer server.Close()
@@ -328,7 +333,9 @@ func TestGetFileReader_success(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != downloadPath {
-			t.Fatalf("unexpected request: %s", r.URL.String())
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
 		}
 		_, _ = w.Write([]byte(fileContent))
 	}))
@@ -354,7 +361,9 @@ func TestGetFileReader_notFound_closesBody(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != downloadPath {
-			t.Fatalf("unexpected request: %s", r.URL.String())
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
 		}
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"errors":[{"message":"Not found"}]}`))
@@ -375,7 +384,9 @@ func TestGetFileReader_cancellation_closesBody(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != downloadPath {
-			t.Fatalf("unexpected request: %s", r.URL.String())
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
 		}
 		w.WriteHeader(http.StatusOK)
 		flusher, ok := w.(http.Flusher)
@@ -451,7 +462,9 @@ func TestGetFileReader_unrelatedErrorContaining404_notSourceGone(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != downloadPath {
-			t.Fatalf("unexpected request: %s", r.URL.String())
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
 		}
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"errors":[{"message":"upstream returned 404 from cache"}]}`))
@@ -474,7 +487,9 @@ func TestGetFileReader_streamSurvivesSlowResponse(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != downloadPath {
-			t.Fatalf("unexpected request: %s", r.URL.String())
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
 		}
 		time.Sleep(streamDelay)
 		_, _ = w.Write([]byte(fileContent))
@@ -645,7 +660,8 @@ func TestGetFileMetadata_sizeParseError_fallbackUsed(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"errors":[{"message":"Unable to find item"}]}`))
 		default:
-			t.Fatalf("unexpected request: %s", r.URL.String())
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
 		}
 	}))
 	defer server.Close()
@@ -657,6 +673,90 @@ func TestGetFileMetadata_sizeParseError_fallbackUsed(t *testing.T) {
 	metadata, err := client.GetFileMetadata(context.Background(), testSourceFile())
 	require.NoError(t, err)
 	assert.Equal(t, int64(11), metadata.Size)
+}
+
+// TestGetFileMetadata_folderHasNoSizeField verifies that folder-info responses, which carry
+// no "size" field at all, resolve to Size 0 instead of failing to parse.
+func TestGetFileMetadata_folderHasNoSizeField(t *testing.T) {
+	storagePath := "/api/storage/" + testSourceRelativePath()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == storagePath && r.URL.RawQuery == "":
+			w.WriteHeader(http.StatusOK)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"repo":         testSourceRepo,
+				"path":         testSourcePath + "/" + testSourceName,
+				"created":      "2020-01-01T00:00:00.000Z",
+				"createdBy":    "admin",
+				"lastModified": "2020-01-02T00:00:00.000Z",
+				"modifiedBy":   "deployer",
+				"children":     []map[string]any{{"uri": "/child", "folder": false}},
+			}))
+		case r.URL.Path == storagePath && r.URL.RawQuery == "properties":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"message":"No properties could be found."}]}`))
+		case r.URL.Path == storagePath && r.URL.RawQuery == "stats":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"message":"Unable to find item"}]}`))
+		default:
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewSourceClient(context.Background(), newTestSourceServerDetails(server.URL))
+	require.NoError(t, err)
+
+	file := testSourceFile()
+	file.Size = 0
+
+	metadata, err := client.GetFileMetadata(context.Background(), file)
+	require.NoError(t, err)
+	require.NotNil(t, metadata)
+	assert.Zero(t, metadata.Size)
+}
+
+// TestGetFileMetadata_folderItem_skipsStatsGET verifies that a real folder item (Name == "",
+// as produced for AQL folder results) resolves Size 0 and never issues the "stats" GET, since
+// download statistics don't apply to folders.
+func TestGetFileMetadata_folderItem_skipsStatsGET(t *testing.T) {
+	folderRelativePath := testSourceRepo + "/" + testSourcePath
+	storagePath := "/api/storage/" + folderRelativePath
+	statsRequested := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == storagePath && r.URL.RawQuery == "":
+			w.WriteHeader(http.StatusOK)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"repo":     testSourceRepo,
+				"path":     testSourcePath,
+				"children": []map[string]any{{"uri": "/child", "folder": false}},
+			}))
+		case r.URL.Path == storagePath && r.URL.RawQuery == "properties":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"message":"No properties could be found."}]}`))
+		case r.URL.Path == storagePath && r.URL.RawQuery == "stats":
+			statsRequested = true
+			w.WriteHeader(http.StatusOK)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{}))
+		default:
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewSourceClient(context.Background(), newTestSourceServerDetails(server.URL))
+	require.NoError(t, err)
+
+	folder := api.FileRepresentation{Repo: testSourceRepo, Path: testSourcePath, Name: ""}
+	metadata, err := client.GetFileMetadata(context.Background(), folder)
+	require.NoError(t, err)
+	require.NotNil(t, metadata)
+	assert.Zero(t, metadata.Size)
+	assert.False(t, statsRequested, "stats GET must be skipped for a folder item")
 }
 
 // TestSourceClient_metadataAndContentGET_usesOnlySourceCredentials exercises both
@@ -701,7 +801,8 @@ func TestSourceClient_metadataAndContentGET_usesOnlySourceCredentials(t *testing
 			sawContentGET = true
 			_, _ = w.Write([]byte(fileContent))
 		default:
-			t.Fatalf("unexpected source request: %s", r.URL.String())
+			t.Errorf("unexpected source request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
 		}
 	}))
 	defer source.Close()

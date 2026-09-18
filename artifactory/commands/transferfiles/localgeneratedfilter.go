@@ -58,7 +58,7 @@ func NewLocallyGenerated(context context.Context, serviceManager artifactory.Art
 // Files that are generated automatically by Artifactory on the target instance (also known as "locally generated files") should not be transferred.
 // aqlResults - Directory content in phase 1 or 15 minutes interval results in phase 2.
 // packageType is the source repository package type (used when the target is older than 7.55).
-// Optional so this slice compiles before PR #4 updates filesdiff.go / fulltransfer.go call sites.
+// Variadic so callers may omit it; an empty value means no legacy package-type filter is applied.
 func (lg *locallyGeneratedFilter) FilterLocallyGenerated(aqlResultItems []utils.ResultItem, packageType ...string) ([]utils.ResultItem, error) {
 	pt := ""
 	if len(packageType) > 0 {
