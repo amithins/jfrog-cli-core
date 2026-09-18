@@ -952,6 +952,43 @@ func TestTargetClient_Put_errorReleasesEligibleProperties(t *testing.T) {
 		"failed Put must release eligibleCache without ApplyProperties")
 }
 
+func TestTargetClient_Put_classifiesPermanentStatusAndKeepsBodyText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"forbidden by target"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+
+	metadata := testTargetMetadata()
+	err = client.Put(context.Background(), metadata, strings.NewReader("hello world"), defaultTargetDeployOptions())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "permanent target HTTP 403",
+		"plain PUT must reach the permanent/retryable classification, not bail out on UploadFileFromReader's status-only error")
+	assert.Contains(t, err.Error(), "forbidden by target",
+		"the classified error must still carry the response body text")
+}
+
+func TestTargetClient_Put_classifiesRetryableStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"slow down"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	require.NoError(t, err)
+
+	metadata := testTargetMetadata()
+	err = client.Put(context.Background(), metadata, strings.NewReader("hello world"), defaultTargetDeployOptions())
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "permanent target HTTP",
+		"429 must remain retryable, not be classified as permanent")
+	assert.Contains(t, err.Error(), "slow down")
+}
+
 func TestTargetClient_CreateFolder_errorReleasesEligibleProperties(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusForbidden)

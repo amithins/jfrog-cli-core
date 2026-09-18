@@ -156,18 +156,28 @@ func (tc *TargetClient) Put(ctx context.Context, metadata *SourceFileMetadata, r
 	// X-Checksum-Md5 (even when Md5 is empty). Plain PUT must omit that header; it is
 	// reserved for CheckExistenceInFilestore checksum-deploy.
 	resp, body, err := tc.streamServiceManager.Client().UploadFileFromReader(reader, deployURL, &httpClientsDetails, metadata.Size)
-	if err != nil {
-		tc.ReleaseEligibleProperties(metadata, options)
-		return err
-	}
 	if resp == nil {
+		// Transport-level failure: no status code to classify against.
 		tc.ReleaseEligibleProperties(metadata, options)
+		if err != nil {
+			return err
+		}
 		return errorutils.CheckErrorf("received empty response from target deploy")
 	}
 	if isSuccessfulDeployStatusCode(resp.StatusCode) {
 		return nil
 	}
 	tc.ReleaseEligibleProperties(metadata, options)
+	// UploadFileFromReader returns as soon as the status check fails, without reading the
+	// body into the body return value, but err (from errorutils.CheckResponseStatus) already
+	// carries the body text read off resp.Body. Reuse it instead of re-deriving from a nil
+	// body, but still apply the permanent/retryable classification.
+	if err != nil {
+		if isPermanentHTTPStatus(resp.StatusCode) {
+			return fmt.Errorf("permanent target HTTP %d: %w", resp.StatusCode, err)
+		}
+		return err
+	}
 	return permanentOrRetryableResponseError(resp, body, http.StatusOK, http.StatusCreated, http.StatusAccepted)
 }
 
