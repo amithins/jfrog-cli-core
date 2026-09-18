@@ -13,6 +13,7 @@ import (
 )
 
 var saveStateMutex sync.RWMutex
+var stateCountersMutex sync.RWMutex
 
 type ActionOnStateFunc func(state *TransferState) error
 
@@ -90,7 +91,11 @@ func (ts *TransferState) persistTransferState(snapshot bool) (err error) {
 		return err
 	}
 
-	content, err := json.Marshal(ts)
+	content, err := func() ([]byte, error) {
+		stateCountersMutex.RLock()
+		defer stateCountersMutex.RUnlock()
+		return json.Marshal(ts)
+	}()
 	if err != nil {
 		return errorutils.CheckError(err)
 	}
