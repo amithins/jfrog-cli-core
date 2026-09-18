@@ -26,7 +26,6 @@ type fileTransferTarget interface {
 
 type FileTransferOptions struct {
 	TargetDeployOptions TargetDeployOptions
-	BuildInfoRepo       bool
 	StreamBufferSize    int
 }
 
