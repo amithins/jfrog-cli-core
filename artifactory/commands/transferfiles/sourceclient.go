@@ -90,12 +90,17 @@ func (sc *SourceClient) GetFileMetadata(ctx context.Context, file api.FileRepres
 		return nil, err
 	}
 
-	size, parseErr := strconv.ParseInt(fileInfo.Size, 10, 64)
-	if parseErr != nil {
-		if file.Size > 0 {
-			size = file.Size
-		} else {
-			return nil, fmt.Errorf("failed to parse file size %q for %s: %w", fileInfo.Size, relativePath, parseErr)
+	// Folder-info responses carry no "size" field; treat that as size 0 rather than a parse failure.
+	var size int64
+	if fileInfo.Size != "" {
+		var parseErr error
+		size, parseErr = strconv.ParseInt(fileInfo.Size, 10, 64)
+		if parseErr != nil {
+			if file.Size > 0 {
+				size = file.Size
+			} else {
+				return nil, fmt.Errorf("failed to parse file size %q for %s: %w", fileInfo.Size, relativePath, parseErr)
+			}
 		}
 	}
 

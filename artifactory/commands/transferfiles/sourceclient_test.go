@@ -659,6 +659,47 @@ func TestGetFileMetadata_sizeParseError_fallbackUsed(t *testing.T) {
 	assert.Equal(t, int64(11), metadata.Size)
 }
 
+// TestGetFileMetadata_folderHasNoSizeField verifies that folder-info responses, which carry
+// no "size" field at all, resolve to Size 0 instead of failing to parse.
+func TestGetFileMetadata_folderHasNoSizeField(t *testing.T) {
+	storagePath := "/api/storage/" + testSourceRelativePath()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == storagePath && r.URL.RawQuery == "":
+			w.WriteHeader(http.StatusOK)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"repo":         testSourceRepo,
+				"path":         testSourcePath + "/" + testSourceName,
+				"created":      "2020-01-01T00:00:00.000Z",
+				"createdBy":    "admin",
+				"lastModified": "2020-01-02T00:00:00.000Z",
+				"modifiedBy":   "deployer",
+				"children":     []map[string]any{{"uri": "/child", "folder": false}},
+			}))
+		case r.URL.Path == storagePath && r.URL.RawQuery == "properties":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"message":"No properties could be found."}]}`))
+		case r.URL.Path == storagePath && r.URL.RawQuery == "stats":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"message":"Unable to find item"}]}`))
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewSourceClient(context.Background(), newTestSourceServerDetails(server.URL))
+	require.NoError(t, err)
+
+	file := testSourceFile()
+	file.Size = 0
+
+	metadata, err := client.GetFileMetadata(context.Background(), file)
+	require.NoError(t, err)
+	require.NotNil(t, metadata)
+	assert.Zero(t, metadata.Size)
+}
+
 // TestSourceClient_metadataAndContentGET_usesOnlySourceCredentials exercises both
 // metadata GET and content GET against a live source httptest while a distinct
 // target httptest must receive zero traffic.
