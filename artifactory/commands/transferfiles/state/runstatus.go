@@ -15,7 +15,7 @@ import (
 // Can be used to identify when the version of the CLI doesn't support the structure of the transfer directory.
 const transferRunStatusVersion = 1
 
-var saveRunStatusMutex sync.Mutex
+var saveRunStatusMutex sync.RWMutex
 var workingThreadsMutex sync.RWMutex
 
 type ActionOnStatusFunc func(transferRunStatus *TransferRunStatus) error
@@ -65,8 +65,10 @@ func (ts *TransferRunStatus) action(action ActionOnStatusFunc) error {
 		return err
 	}
 
-	now := time.Now()
-	if now.Sub(ts.lastSaveTimestamp).Seconds() < float64(stateAndStatusSaveIntervalSecs) {
+	saveRunStatusMutex.RLock()
+	sinceLastSave := time.Since(ts.lastSaveTimestamp).Seconds()
+	saveRunStatusMutex.RUnlock()
+	if sinceLastSave < float64(stateAndStatusSaveIntervalSecs) {
 		return nil
 	}
 
@@ -75,7 +77,7 @@ func (ts *TransferRunStatus) action(action ActionOnStatusFunc) error {
 	}
 	defer saveRunStatusMutex.Unlock()
 
-	ts.lastSaveTimestamp = now
+	ts.lastSaveTimestamp = time.Now()
 	return ts.persistTransferRunStatus()
 }
 

@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-var saveStateMutex sync.Mutex
+var saveStateMutex sync.RWMutex
 
 type ActionOnStateFunc func(state *TransferState) error
 
@@ -63,19 +63,23 @@ func newRepositoryTransferState(repoKey string) TransferState {
 }
 
 func (ts *TransferState) Action(action ActionOnStateFunc) error {
-	saveStateMutex.Lock()
-	defer saveStateMutex.Unlock()
-
 	if err := action(ts); err != nil {
 		return err
 	}
 
-	now := time.Now()
-	if now.Sub(ts.lastSaveTimestamp).Seconds() < float64(stateAndStatusSaveIntervalSecs) {
+	saveStateMutex.RLock()
+	sinceLastSave := time.Since(ts.lastSaveTimestamp).Seconds()
+	saveStateMutex.RUnlock()
+	if sinceLastSave < float64(stateAndStatusSaveIntervalSecs) {
 		return nil
 	}
 
-	ts.lastSaveTimestamp = now
+	if !saveStateMutex.TryLock() {
+		return nil
+	}
+	defer saveStateMutex.Unlock()
+
+	ts.lastSaveTimestamp = time.Now()
 	return ts.persistTransferState(false)
 }
 
