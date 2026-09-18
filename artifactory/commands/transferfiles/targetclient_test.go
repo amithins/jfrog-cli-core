@@ -998,7 +998,7 @@ func TestTargetClient_Put_ctxCancelAbortsInFlightRequest(t *testing.T) {
 	defer server.Close()
 	defer close(unblock)
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1024,7 +1024,7 @@ func TestTargetClient_ApplyProperties_ctxCancelAbortsInFlightPatch(t *testing.T)
 	defer server.Close()
 	defer close(unblock)
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
