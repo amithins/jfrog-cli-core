@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -83,6 +84,7 @@ type TransferFilesCommand struct {
 	sourceClient           *SourceClient
 	targetClient           *TargetClient
 	fileTransfer           *FileTransfer
+	targetProxyTransport   http.RoundTripper
 }
 
 func NewTransferFilesCommand(sourceServer, targetServer *config.ServerDetails) (*TransferFilesCommand, error) {
@@ -218,6 +220,16 @@ func (tdc *TransferFilesCommand) Run() (err error) {
 	if tdc.stop {
 		return tdc.signalStop()
 	}
+	if tdc.proxyKey != "" {
+		proxyURL, parseErr := parseProxyKeyURL(tdc.proxyKey)
+		if parseErr != nil {
+			return parseErr
+		}
+		tdc.targetProxyTransport, err = newTargetProxyTransport(proxyURL, tdc.targetServerDetails)
+		if err != nil {
+			return err
+		}
+	}
 	if tdc.timestampFilter, err = tdc.resolveTimestampFilter(); err != nil {
 		return err
 	}
@@ -235,7 +247,7 @@ func (tdc *TransferFilesCommand) Run() (err error) {
 	if err != nil {
 		return err
 	}
-	tdc.targetClient, err = NewTargetClient(tdc.context, tdc.targetServerDetails)
+	tdc.targetClient, err = NewTargetClient(tdc.context, tdc.targetServerDetails, tdc.targetProxyTransport)
 	if err != nil {
 		return err
 	}
@@ -272,12 +284,12 @@ func (tdc *TransferFilesCommand) Run() (err error) {
 		return err
 	}
 
-	sourceLocalRepos, sourceBuildInfoRepos, err := tdc.getAllLocalRepos(tdc.sourceServerDetails, tdc.sourceStorageInfoManager)
+	sourceLocalRepos, sourceBuildInfoRepos, err := tdc.getAllLocalRepos(tdc.sourceServerDetails, tdc.sourceStorageInfoManager, false)
 	if err != nil {
 		return err
 	}
 	allSourceLocalRepos := append(slices.Clone(sourceLocalRepos), sourceBuildInfoRepos...)
-	targetLocalRepos, targetBuildInfoRepos, err := tdc.getAllLocalRepos(tdc.targetServerDetails, tdc.targetStorageInfoManager)
+	targetLocalRepos, targetBuildInfoRepos, err := tdc.getAllLocalRepos(tdc.targetServerDetails, tdc.targetStorageInfoManager, true)
 	if err != nil {
 		return err
 	}
@@ -409,7 +421,7 @@ func (tdc *TransferFilesCommand) initStorageInfoManagers() error {
 	}
 
 	// Init target storage info manager
-	storageInfoManager, err = utils.NewStorageInfoManager(tdc.context, tdc.targetServerDetails)
+	storageInfoManager, err = utils.NewStorageInfoManagerWithHttpClient(tdc.context, tdc.targetServerDetails, tdc.targetServiceHTTPClient())
 	if err != nil {
 		return err
 	}
@@ -419,7 +431,7 @@ func (tdc *TransferFilesCommand) initStorageInfoManagers() error {
 
 func (tdc *TransferFilesCommand) initDistinctAql() error {
 	// Init source storage services manager
-	servicesManager, err := createTransferServiceManager(tdc.context, tdc.sourceServerDetails)
+	servicesManager, err := createTransferServiceManager(tdc.context, tdc.sourceServerDetails, nil)
 	if err != nil {
 		return err
 	}
@@ -442,7 +454,7 @@ func (tdc *TransferFilesCommand) initDistinctAql() error {
 // Creates the Pre-checks runner for the data transfer command
 func (tdc *TransferFilesCommand) NewTransferDataPreChecksRunner() (runner *precheckrunner.PreCheckRunner, err error) {
 	// Get relevant repos
-	serviceManager, err := createTransferServiceManager(tdc.context, tdc.sourceServerDetails)
+	serviceManager, err := createTransferServiceManager(tdc.context, tdc.sourceServerDetails, nil)
 	if err != nil {
 		return
 	}
@@ -695,8 +707,8 @@ func (tdc *TransferFilesCommand) initNewPhase(newPhase transferPhase, repoSummar
 // Get all local and build-info repositories of the input server
 // serverDetails      - Source or target server details
 // storageInfoManager - Source or target storage info manager
-func (tdc *TransferFilesCommand) getAllLocalRepos(serverDetails *config.ServerDetails, storageInfoManager *utils.StorageInfoManager) ([]string, []string, error) {
-	serviceManager, err := createTransferServiceManager(tdc.context, serverDetails)
+func (tdc *TransferFilesCommand) getAllLocalRepos(serverDetails *config.ServerDetails, storageInfoManager *utils.StorageInfoManager, isTarget bool) ([]string, []string, error) {
+	serviceManager, err := createTransferServiceManager(tdc.context, serverDetails, tdc.httpClientForServer(isTarget))
 	if err != nil {
 		return []string{}, []string{}, err
 	}
@@ -749,7 +761,7 @@ func (tdc *TransferFilesCommand) initCurThreads(buildInfoRepo bool) error {
 }
 
 func (tdc *TransferFilesCommand) initLocallyGeneratedFilter() error {
-	servicesManager, err := createTransferServiceManager(tdc.context, tdc.targetServerDetails)
+	servicesManager, err := createTransferServiceManager(tdc.context, tdc.targetServerDetails, tdc.targetServiceHTTPClient())
 	if err != nil {
 		return err
 	}
@@ -825,7 +837,7 @@ func (tdc *TransferFilesCommand) handleMaxUniqueSnapshots(repoSummary *serviceUt
 	// If it's a Maven, Gradle, NuGet, Ivy, SBT or Docker repository, update its max unique snapshots setting to 0.
 	// srcMaxUniqueSnapshots == -1 means it's a repository of another package type.
 	if srcMaxUniqueSnapshots != -1 {
-		err = updateMaxUniqueSnapshots(tdc.context, tdc.targetServerDetails, repoSummary, 0)
+		err = updateMaxUniqueSnapshots(tdc.context, tdc.targetServerDetails, repoSummary, 0, tdc.targetServiceHTTPClient())
 		if err != nil {
 			return
 		}
@@ -834,7 +846,7 @@ func (tdc *TransferFilesCommand) handleMaxUniqueSnapshots(repoSummary *serviceUt
 	restoreFunc = func() (err error) {
 		// Update the target repository's max unique snapshots setting to be the same as in the source, only if it's not 0.
 		if srcMaxUniqueSnapshots > 0 {
-			err = updateMaxUniqueSnapshots(tdc.context, tdc.targetServerDetails, repoSummary, srcMaxUniqueSnapshots)
+			err = updateMaxUniqueSnapshots(tdc.context, tdc.targetServerDetails, repoSummary, srcMaxUniqueSnapshots, tdc.targetServiceHTTPClient())
 		}
 		return
 	}

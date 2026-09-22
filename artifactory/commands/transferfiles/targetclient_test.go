@@ -71,7 +71,7 @@ func TestTargetClient_Ping_usesSystemPing(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	err = client.Ping(context.Background())
@@ -99,7 +99,7 @@ func TestTargetClient_TryChecksumDeploy_hit_sendsNoBody(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	outcome, err := client.TryChecksumDeploy(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
@@ -119,7 +119,7 @@ func TestTargetClient_TryChecksumDeploy_missOn404(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	outcome, err := client.TryChecksumDeploy(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
@@ -134,7 +134,7 @@ func TestTargetClient_TryChecksumDeploy_conflictDoesNotFallThrough(t *testing.T)
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	outcome, err := client.TryChecksumDeploy(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
@@ -149,7 +149,7 @@ func TestTargetClient_TryChecksumDeploy_skipsBuildInfoRepo(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	options := defaultTargetDeployOptions()
@@ -175,7 +175,7 @@ func TestTargetClient_TryChecksumDeploy_filestoreOptionHeaders(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	options := defaultTargetDeployOptions()
@@ -210,7 +210,7 @@ func TestTargetClient_Put_setsContentLengthAndChecksumHeaders(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -233,7 +233,7 @@ func TestTargetClient_ApplyProperties_setsEligibleProperties(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	skippedLargeProps, err := client.ApplyProperties(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
@@ -257,7 +257,7 @@ func TestTargetClient_ApplyProperties_omitsValuesLongerThan2400(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	skippedLargeProps, err := client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
@@ -288,7 +288,7 @@ func TestTargetClient_ApplyProperties_usesPatchWhenEncodedPayloadExceeds4000(t *
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	skippedLargeProps, err := client.ApplyProperties(context.Background(), metadata, defaultTargetDeployOptions())
@@ -313,7 +313,7 @@ func TestTargetClient_ApplyProperties_usesPutQueryWhenEncodedPayloadAtMost4000(t
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -346,7 +346,7 @@ func TestTargetClient_ApplyProperties_stripsGeneratedPropertyKeys(t *testing.T) 
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	// ruby/baseUrl are only package-generated for their own package type (gems/pub); a
@@ -370,7 +370,7 @@ func TestTargetClient_ApplyProperties_stripsPackageScopedGeneratedKeys(t *testin
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	gemsMetadata := testTargetMetadata()
@@ -402,7 +402,7 @@ func TestTargetClient_ApplyProperties_preservesMultiValues(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -437,7 +437,7 @@ func TestTargetClient_CreateFolder_putsZeroByteBody(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	err = client.CreateFolder(context.Background(), folderMetadata, defaultTargetDeployOptions())
@@ -455,7 +455,7 @@ func TestTargetClient_noPluginExecuteURLs(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	require.NoError(t, client.Ping(context.Background()))
@@ -487,7 +487,7 @@ func TestTargetClient_checksumDeploy409IsHardFailure(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	outcome, err := client.TryChecksumDeploy(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
@@ -522,7 +522,7 @@ func TestNewTargetClient_streamServiceManagerHasNoOverallTimeoutOrRetries(t *tes
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	streamConfig := client.streamServiceManager.GetConfig()
@@ -541,7 +541,7 @@ func TestTargetClient_TryChecksumDeploy_skipsWhenSha1Empty(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -573,7 +573,7 @@ func TestTargetClient_emptySha1UsesPutStreamPath(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -599,7 +599,7 @@ func Test_addIdentityHeaders_convertsIsoTimestampsToEpochMilliseconds(t *testing
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	err = client.Put(context.Background(), testTargetMetadata(), strings.NewReader("hello world"), defaultTargetDeployOptions())
@@ -619,7 +619,7 @@ func Test_addIdentityHeaders_preservesNumericTimestamps(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -646,7 +646,7 @@ func Test_addIdentityHeaders_omitsInvalidTimestamps(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -682,7 +682,7 @@ func TestTargetClient_ApplyStatistics_putsItemStatisticsXML(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -709,7 +709,7 @@ func TestTargetClient_ApplyStatistics_rejectedStatus_doesNotFail(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -726,7 +726,7 @@ func TestTargetClient_ApplyStatistics_skipsWhenEmpty(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	err = client.ApplyStatistics(context.Background(), testTargetMetadata())
@@ -741,7 +741,7 @@ func TestTargetClient_ApplyStatistics_skipsFolders(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	err = client.ApplyStatistics(context.Background(), &SourceFileMetadata{
@@ -764,7 +764,7 @@ func TestTargetClient_sendsTargetCredentials(t *testing.T) {
 
 	details := newTestTargetServerDetails(server.URL)
 	details.AccessToken = "target-secret-token"
-	client, err := NewTargetClient(context.Background(), details)
+	client, err := NewTargetClient(context.Background(), details, nil)
 	require.NoError(t, err)
 
 	require.NoError(t, client.Ping(context.Background()))
@@ -792,7 +792,7 @@ func TestTargetClient_sendsTargetCredentials_putAndPatch(t *testing.T) {
 
 	details := newTestTargetServerDetails(server.URL)
 	details.AccessToken = "target-secret-token"
-	client, err := NewTargetClient(context.Background(), details)
+	client, err := NewTargetClient(context.Background(), details, nil)
 	require.NoError(t, err)
 
 	require.NoError(t, client.Put(context.Background(), testTargetMetadata(), strings.NewReader("hello world"), defaultTargetDeployOptions()))
@@ -815,7 +815,7 @@ func TestTargetClient_TryChecksumDeploy_permanent4xxFailsFast(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	outcome, err := client.TryChecksumDeploy(context.Background(), testTargetMetadata(), defaultTargetDeployOptions())
@@ -843,7 +843,7 @@ func TestTargetClient_TryChecksumDeploy_retryableStatusUsesMetadataRetryPolicy(t
 			defer server.Close()
 
 			details := newTestTargetServerDetails(server.URL)
-			client, err := NewTargetClient(context.Background(), details)
+			client, err := NewTargetClient(context.Background(), details, nil)
 			require.NoError(t, err)
 			client.metadataServiceManager, err = transferutils.CreateServiceManagerWithContext(
 				context.Background(), details, false, 0, metadataRetries, 0, time.Minute,
@@ -867,7 +867,7 @@ func TestTargetClient_TryChecksumDeploy_retryableStatusUsesMetadataRetryPolicy(t
 // manager with a small retry count to keep the test fast. This asserts the manager NewTargetClient
 // actually builds (without any override) carries the dedicated metadata retry budget.
 func TestNewTargetClient_metadataServiceManagerUsesProductionRetryPolicy(t *testing.T) {
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails("http://127.0.0.1:0"))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails("http://127.0.0.1:0"), nil)
 	require.NoError(t, err)
 	assert.Equal(t, metadataTransferRetries, client.metadataServiceManager.GetConfig().GetHttpRetries())
 	assert.Equal(t, metadataRetryWaitMilliSecs, client.metadataServiceManager.GetConfig().GetHttpRetryWaitMilliSecs())
@@ -886,7 +886,7 @@ func TestTargetClient_eligiblePropertiesComputedOnceAcrossFileAndFolderOperation
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 	var filterCalls atomic.Int32
 	client.filterEligibleProperties = func(
@@ -929,7 +929,7 @@ func TestTargetClient_concurrentTransfersDoNotEvictEligibleProperties(t *testing
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 	var filterCalls atomic.Int32
 	client.filterEligibleProperties = func(
@@ -985,7 +985,7 @@ func TestTargetClient_Put_errorReleasesEligibleProperties(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -1003,7 +1003,7 @@ func TestTargetClient_Put_classifiesPermanentStatusAndKeepsBodyText(t *testing.T
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -1022,7 +1022,7 @@ func TestTargetClient_Put_classifiesRetryableStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -1042,7 +1042,7 @@ func TestTargetClient_Put_ctxCancelAbortsInFlightRequest(t *testing.T) {
 	defer server.Close()
 	defer close(unblock)
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1085,7 +1085,7 @@ func TestTargetClient_Put_ctxCancelAbortsMidBodyWrite(t *testing.T) {
 	}))
 	defer targetServer.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(targetServer.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(targetServer.URL), nil)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1121,7 +1121,7 @@ func TestTargetClient_ApplyProperties_ctxCancelAbortsInFlightPatch(t *testing.T)
 	defer server.Close()
 	defer close(unblock)
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := testTargetMetadata()
@@ -1148,7 +1148,7 @@ func TestTargetClient_CreateFolder_errorReleasesEligibleProperties(t *testing.T)
 	}))
 	defer server.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
 	require.NoError(t, err)
 
 	metadata := &SourceFileMetadata{
