@@ -46,6 +46,73 @@ func TestCancelFunc(t *testing.T) {
 	assert.True(t, transferFilesCommand.shouldStop())
 }
 
+func TestCancelFuncCancelsInFlightTransferFile(t *testing.T) {
+	transferFilesCommand, err := NewTransferFilesCommand(nil, nil)
+	require.NoError(t, err)
+
+	source := &cancelAwareTransferSource{started: make(chan struct{})}
+	fileTransfer := NewFileTransfer(source, &mockTransferTarget{}, FileTransferOptions{})
+	resultChannel := make(chan TransferResult, 1)
+	go func() {
+		resultChannel <- fileTransfer.TransferFile(transferFilesCommand.context, testFileCandidate())
+	}()
+
+	<-source.started
+	transferFilesCommand.cancelFunc()
+
+	select {
+	case result := <-resultChannel:
+		require.ErrorIs(t, result.Err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight TransferFile did not return promptly after stop")
+	}
+}
+
+func TestHandleStopDumpsThreadsBeforeCancelingInFlightTransferFile(t *testing.T) {
+	testServer, serverDetails, srcUpService := createMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write([]byte(`{"isHa":false,"nodes":[]}`))
+		assert.NoError(t, err)
+	})
+	defer testServer.Close()
+
+	transferFilesCommand, err := NewTransferFilesCommand(serverDetails, nil)
+	require.NoError(t, err)
+	dumpStarted := make(chan struct{})
+	finishDump := make(chan struct{})
+	transferFilesCommand.threadDump = func() error {
+		close(dumpStarted)
+		<-finishDump
+		return nil
+	}
+	finishStopping, _ := transferFilesCommand.handleStop(srcUpService)
+	defer finishStopping()
+
+	source := &cancelAwareTransferSource{started: make(chan struct{})}
+	fileTransfer := NewFileTransfer(source, &mockTransferTarget{}, FileTransferOptions{})
+	resultChannel := make(chan TransferResult, 1)
+	go func() {
+		resultChannel <- fileTransfer.TransferFile(transferFilesCommand.context, testFileCandidate())
+	}()
+
+	<-source.started
+	transferFilesCommand.stopSignal <- os.Interrupt
+	<-dumpStarted
+	select {
+	case <-transferFilesCommand.context.Done():
+		t.Fatal("transfer context was canceled before thread dump finished")
+	default:
+	}
+
+	close(finishDump)
+	select {
+	case result := <-resultChannel:
+		require.ErrorIs(t, result.Err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight TransferFile did not return promptly after thread dump finished")
+	}
+}
+
 func TestSignalStop(t *testing.T) {
 	cleanUpJfrogHome, err := tests.SetJfrogHome()
 	assert.NoError(t, err)
@@ -203,6 +270,45 @@ func TestUploadChunkAndPollUploads(t *testing.T) {
 	// First request - get one DONE chunk and one IN PROGRESS
 	// Second Request - get DONE for the other chunk
 	assert.Equal(t, 2, totalChunkStatusVisits)
+}
+
+// Reproduces the regression where pollUploads reset WorkingThreads to 0 on every loop iteration,
+// which zeroed out TimeEstimationManager's speed-samples window and left speed/ETA "Not available" for the whole run.
+func TestUploadChunkAndPollUploads_workingThreadsSurviveForSpeedEstimation(t *testing.T) {
+	stateManager, cleanUp := state.InitStateTest(t)
+	defer cleanUp()
+
+	totalChunkStatusVisits := 0
+	totalUploadChunkVisits := 0
+	fileSample := api.FileRepresentation{
+		Repo: repo1Key,
+		Path: "rel-path",
+		Name: "name-demo",
+	}
+
+	testServer, serverDetails, _ := initPollUploadsTestMockServer(t, &totalChunkStatusVisits, &totalUploadChunkVisits, fileSample)
+	defer testServer.Close()
+	srcPluginManager := initSrcUserPluginServiceManager(t, serverDetails)
+
+	assert.NoError(t, stateManager.SetRepoState(repo1Key, 0, 0, false, true))
+	phaseBase := &phaseBase{context: context.Background(), stateManager: stateManager, srcUpService: srcPluginManager, repoKey: repo1Key}
+	uploadChunkAndPollTwice(t, phaseBase, fileSample)
+
+	// pollUploads should have reported the live number of in-flight chunks as the working threads count,
+	// not reset it to 0.
+	workingThreads, err := stateManager.GetWorkingThreads()
+	assert.NoError(t, err)
+	assert.NotZero(t, workingThreads)
+
+	// With a non-zero working threads count in place, a chunk completion should now produce a usable speed sample.
+	chunkStatus := api.ChunkStatus{
+		Files: []api.FileUploadStatusResponse{
+			{FileRepresentation: fileSample, SizeBytes: 10 * artifactoryUtils.SizeMiB, Status: api.Success},
+		},
+	}
+	assert.NoError(t, stateManager.TimeEstimationManager.AddChunkStatus(chunkStatus, 1000))
+	assert.NotEmpty(t, stateManager.TimeEstimationManager.LastSpeeds)
+	assert.NotEqual(t, "Not available yet", stateManager.TimeEstimationManager.GetSpeedString())
 }
 
 // Sends chunk to upload, polls on chunk three times - once when it is still in progress, once after done received and once to notify back to the source.
