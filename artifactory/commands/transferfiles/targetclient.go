@@ -79,6 +79,11 @@ type eligiblePropertiesCacheKey struct {
 type eligiblePropertiesCacheValue struct {
 	properties   *artifactoryutils.Properties
 	skippedLarge bool
+	// viaPatch/encoded memoize propertyDelivery's decision for this item, computed once
+	// alongside properties instead of being re-derived by each of TryChecksumDeploy, Put,
+	// CreateFolder, and ApplyProperties.
+	viaPatch bool
+	encoded  string
 }
 
 type TargetClient struct {
@@ -251,8 +256,7 @@ func (tc *TargetClient) TryChecksumDeploy(ctx context.Context, metadata *SourceF
 	if err != nil {
 		return ChecksumDeployMiss, err
 	}
-	eligibleProps, _ := tc.eligibleProperties(metadata, options)
-	deployURL += propertyMatrixSuffixFromEligible(eligibleProps)
+	deployURL += tc.propertyMatrixSuffix(metadata, options)
 	httpClientsDetails := tc.metadataServiceManager.GetConfig().GetServiceDetails().CreateHttpClientDetails()
 	addDeployHeaders(&httpClientsDetails, tc.metadataServiceManager.GetConfig().GetServiceDetails(), metadata, options, true)
 	resp, body, err := doManagerPut(ctx, tc.metadataServiceManager, deployURL, nil, httpClientsDetails)
@@ -289,8 +293,7 @@ func (tc *TargetClient) Put(ctx context.Context, metadata *SourceFileMetadata, r
 	if err != nil {
 		return err
 	}
-	eligibleProps, _ := tc.eligibleProperties(metadata, options)
-	deployURL += propertyMatrixSuffixFromEligible(eligibleProps)
+	deployURL += tc.propertyMatrixSuffix(metadata, options)
 	httpClientsDetails := tc.streamServiceManager.GetConfig().GetServiceDetails().CreateHttpClientDetails()
 	addDeployHeaders(&httpClientsDetails, tc.streamServiceManager.GetConfig().GetServiceDetails(), metadata, options, false)
 	// Skip artifactoryutils.UploadFileFromReader: it always AddChecksumHeaders including
@@ -322,8 +325,7 @@ func (tc *TargetClient) CreateFolder(ctx context.Context, metadata *SourceFileMe
 	if err != nil {
 		return err
 	}
-	eligibleProps, _ := tc.eligibleProperties(metadata, options)
-	deployURL += propertyMatrixSuffixFromEligible(eligibleProps)
+	deployURL += tc.propertyMatrixSuffix(metadata, options)
 	httpClientsDetails := tc.metadataServiceManager.GetConfig().GetServiceDetails().CreateHttpClientDetails()
 	addIdentityHeaders(&httpClientsDetails, metadata)
 	resp, body, err := doManagerPut(ctx, tc.metadataServiceManager, deployURL, nil, httpClientsDetails)
@@ -342,17 +344,15 @@ func (tc *TargetClient) ApplyProperties(ctx context.Context, metadata *SourceFil
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	eligibleProps, skippedLargeProps := tc.eligibleProperties(metadata, options)
+	entry := tc.eligiblePropertiesEntry(metadata, options)
 	defer tc.ReleaseEligibleProperties(metadata, options)
-	if eligibleProps.KeysLen() == 0 {
-		return skippedLargeProps, nil
+	if !entry.viaPatch {
+		// Short, path-safe maps are applied as matrix params on checksum/full PUT.
+		return entry.skippedLarge, nil
 	}
-	if len(eligibleProps.ToEncodedString(false)) <= maxPropertyEncodedStringLength {
-		// Short property maps are applied as matrix params on checksum/full PUT.
-		return skippedLargeProps, nil
-	}
+	eligibleProps := entry.properties
 	relativePath := strings.TrimSuffix(targetRelativePath(metadata), "/")
-	return skippedLargeProps, tc.applyPropertiesViaPatch(ctx, relativePath, eligibleProps)
+	return entry.skippedLarge, tc.applyPropertiesViaPatch(ctx, relativePath, eligibleProps)
 }
 
 func (tc *TargetClient) applyPropertiesViaPatch(ctx context.Context, relativePath string, eligibleProps *artifactoryutils.Properties) error {
@@ -373,11 +373,11 @@ func (tc *TargetClient) applyPropertiesViaPatch(ctx context.Context, relativePat
 	return permanentOrRetryableResponseError(resp, body, http.StatusNoContent)
 }
 
-func (tc *TargetClient) ApplyStatistics(ctx context.Context, metadata *SourceFileMetadata) error {
+func (tc *TargetClient) ApplyStatistics(ctx context.Context, metadata *SourceFileMetadata, options TargetDeployOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if metadata.Name == "" || !hasDownloadStatistics(metadata) {
+	if skipsDownloadStatistics(options) || metadata.Name == "" || !hasDownloadStatistics(metadata) {
 		return nil
 	}
 	relativePath := strings.TrimSuffix(targetRelativePath(metadata), "/")
@@ -413,26 +413,35 @@ func (tc *TargetClient) ApplyStatistics(ctx context.Context, metadata *SourceFil
 	return nil
 }
 
-// eligibleProperties returns the filtered property set for one file/folder transfer.
-// The metadata pointer is the transfer identity shared by all target operations.
-func (tc *TargetClient) eligibleProperties(metadata *SourceFileMetadata, options TargetDeployOptions) (*artifactoryutils.Properties, bool) {
+// eligiblePropertiesEntry returns the full memoized entry (filtered properties plus the
+// propertyDelivery decision) for one file/folder transfer, computing both only once. The
+// metadata pointer is the transfer identity shared by all target operations.
+func (tc *TargetClient) eligiblePropertiesEntry(metadata *SourceFileMetadata, options TargetDeployOptions) eligiblePropertiesCacheValue {
 	cacheKey := eligiblePropertiesCacheKey{metadata: metadata, packageType: options.PackageType}
 	tc.eligibleMu.Lock()
 	if cached, ok := tc.eligibleCache[cacheKey]; ok {
 		tc.eligibleMu.Unlock()
-		return cached.properties, cached.skippedLarge
+		return cached
 	}
 	tc.eligibleMu.Unlock()
 
 	eligible, skipped := tc.filterEligibleProperties(metadata.Properties, options)
+	viaPatch, encoded := propertyDelivery(eligible)
+	entry := eligiblePropertiesCacheValue{properties: eligible, skippedLarge: skipped, viaPatch: viaPatch, encoded: encoded}
 
 	tc.eligibleMu.Lock()
 	defer tc.eligibleMu.Unlock()
 	if cached, ok := tc.eligibleCache[cacheKey]; ok {
-		return cached.properties, cached.skippedLarge
+		return cached
 	}
-	tc.eligibleCache[cacheKey] = eligiblePropertiesCacheValue{properties: eligible, skippedLarge: skipped}
-	return eligible, skipped
+	tc.eligibleCache[cacheKey] = entry
+	return entry
+}
+
+// eligibleProperties returns the filtered property set for one file/folder transfer.
+func (tc *TargetClient) eligibleProperties(metadata *SourceFileMetadata, options TargetDeployOptions) (*artifactoryutils.Properties, bool) {
+	entry := tc.eligiblePropertiesEntry(metadata, options)
+	return entry.properties, entry.skippedLarge
 }
 
 // HasEligibleProperties reports whether metadata has at least one property eligible for
@@ -456,6 +465,21 @@ func (tc *TargetClient) ReleaseEligibleProperties(metadata *SourceFileMetadata, 
 
 func hasDownloadStatistics(metadata *SourceFileMetadata) bool {
 	return metadata.DownloadCount > 0 || metadata.LastDownloaded > 0 || metadata.LastDownloadedBy != ""
+}
+
+// skipsDownloadStatistics matches Artifactory info repos (BuildInfo, PipeInfo). Those
+// stores ingest JSON metadata and reject PUT path:statistics with application/xml (415).
+// Distribution, Support, and ReleaseBundles accept statistics (lab 201) and are not skipped.
+func skipsDownloadStatistics(options TargetDeployOptions) bool {
+	if options.BuildInfoRepo {
+		return true
+	}
+	switch strings.ToLower(options.PackageType) {
+	case "buildinfo", "pipeinfo":
+		return true
+	default:
+		return false
+	}
 }
 
 func (tc *TargetClient) buildDeployURL(relativePath string) (string, error) {
@@ -557,20 +581,65 @@ func filterEligibleProperties(properties map[string][]string, options TargetDepl
 	return eligibleProps, skippedLargeProps
 }
 
+// isPathUnsafePropertyValue reports characters that Properties.ToEncodedString cannot make
+// matrix-param-safe even after url.QueryEscape: a newline/CR breaks the HTTP request line, "#"
+// starts a URL fragment, "," and "\" are the multi-value/escape separators ToEncodedString
+// itself parses back out, and "|" is unsafe for some reverse proxies in front of Artifactory.
+// ";" and "=" are matrix-param separators too, but ToEncodedString escapes them via
+// url.QueryEscape like any other value byte (-> %3B / %3D), so they round-trip safely and are
+// deliberately not included here.
+func isPathUnsafePropertyValue(value string) bool {
+	return strings.ContainsAny(value, "\n\r#,\\|")
+}
+
+func containsPathUnsafePropertyValue(properties *artifactoryutils.Properties) bool {
+	for key, values := range properties.ToMap() {
+		if isPathUnsafePropertyValue(key) {
+			return true
+		}
+		for _, value := range values {
+			if isPathUnsafePropertyValue(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// propertyDelivery is the single decision for matrix-param vs PATCH. Put,
+// checksum-deploy, and ApplyProperties must not re-derive these conditions.
+func propertyDelivery(eligibleProps *artifactoryutils.Properties) (viaPatch bool, encoded string) {
+	if eligibleProps == nil || eligibleProps.KeysLen() == 0 {
+		return false, ""
+	}
+	encoded = eligibleProps.ToEncodedString(false)
+	if encoded == "" {
+		return false, ""
+	}
+	if len(encoded) > maxPropertyEncodedStringLength || containsPathUnsafePropertyValue(eligibleProps) {
+		return true, encoded
+	}
+	return false, encoded
+}
+
 func (tc *TargetClient) propertyMatrixSuffix(metadata *SourceFileMetadata, options TargetDeployOptions) string {
 	if metadata == nil {
 		return ""
 	}
-	eligibleProps, _ := tc.eligibleProperties(metadata, options)
-	return propertyMatrixSuffixFromEligible(eligibleProps)
+	entry := tc.eligiblePropertiesEntry(metadata, options)
+	return formatPropertyMatrixSuffix(entry.viaPatch, entry.encoded)
 }
 
+// propertyMatrixSuffixFromEligible re-derives the propertyDelivery decision from a Properties
+// set that was not obtained via TargetClient.eligiblePropertiesEntry, so its result is not
+// memoized. Production call sites go through the TargetClient method above instead.
 func propertyMatrixSuffixFromEligible(eligibleProps *artifactoryutils.Properties) string {
-	if eligibleProps == nil || eligibleProps.KeysLen() == 0 {
-		return ""
-	}
-	encoded := eligibleProps.ToEncodedString(false)
-	if encoded == "" || len(encoded) > maxPropertyEncodedStringLength {
+	viaPatch, encoded := propertyDelivery(eligibleProps)
+	return formatPropertyMatrixSuffix(viaPatch, encoded)
+}
+
+func formatPropertyMatrixSuffix(viaPatch bool, encoded string) string {
+	if viaPatch || encoded == "" {
 		return ""
 	}
 	return ";" + encoded
