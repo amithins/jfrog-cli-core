@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
@@ -175,14 +176,44 @@ func TestUpdateMaxUniqueSnapshots(t *testing.T) {
 		t.Run(packageType, func(t *testing.T) {
 			lowerPackageType := strings.ToLower(packageType)
 			repoSummary := &utils.RepositorySummary{RepoKey: lowerPackageType + "-local", PackageType: packageType, RepoType: "LOCAL"}
-			err := updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5)
+			err := updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5, nil)
 			assert.NoError(t, err)
 
 			repoSummary = &utils.RepositorySummary{RepoKey: lowerPackageType + "-federated", PackageType: packageType, RepoType: "FEDERATED"}
-			err = updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5)
+			err = updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5, nil)
 			assert.NoError(t, err)
 		})
 	}
+}
+
+// TestUpdateMaxUniqueSnapshots_usesProvidedHttpClient locks in that the httpClient parameter
+// (the target-only --proxy-key transport, when set) is actually used by the underlying service
+// manager, rather than silently falling back to client-go's default transport.
+func TestUpdateMaxUniqueSnapshots_usesProvidedHttpClient(t *testing.T) {
+	testServer, serverDetails := createMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, err := fmt.Fprint(w, "Repository updated successfully.")
+		assert.NoError(t, err)
+	})
+	defer testServer.Close()
+
+	var roundTripCount int32
+	httpClient := &http.Client{Transport: countingRoundTripper{inner: http.DefaultTransport, count: &roundTripCount}}
+
+	repoSummary := &utils.RepositorySummary{RepoKey: "maven-local", PackageType: maven, RepoType: "LOCAL"}
+	err := updateMaxUniqueSnapshots(context.Background(), serverDetails, repoSummary, 5, httpClient)
+	assert.NoError(t, err)
+	assert.Greater(t, atomic.LoadInt32(&roundTripCount), int32(0), "updateMaxUniqueSnapshots must route through the provided httpClient")
+}
+
+type countingRoundTripper struct {
+	inner http.RoundTripper
+	count *int32
+}
+
+func (c countingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	atomic.AddInt32(c.count, 1)
+	return c.inner.RoundTrip(req)
 }
 
 func TestInterruptIfRequested(t *testing.T) {
@@ -298,16 +329,16 @@ func TestUpdateThreads_updatesReportedWorkingThreads(t *testing.T) {
 func TestTransferServiceManagers_useOperationSpecificRetryBudgets(t *testing.T) {
 	details := newTestTargetServerDetails("http://127.0.0.1:1")
 
-	sharedManager, err := createTransferServiceManager(context.Background(), details)
+	sharedManager, err := createTransferServiceManager(context.Background(), details, nil)
 	require.NoError(t, err)
 	assert.Equal(t, retries, sharedManager.GetConfig().GetHttpRetries())
 
-	metadataManager, err := createMetadataTransferServiceManager(context.Background(), details)
+	metadataManager, err := createMetadataTransferServiceManager(context.Background(), details, nil)
 	require.NoError(t, err)
 	assert.Equal(t, metadataTransferRetries, metadataManager.GetConfig().GetHttpRetries())
 	assert.LessOrEqual(t, metadataManager.GetConfig().GetHttpRetries(), 5)
 
-	streamManager, err := createStreamingTransferServiceManager(context.Background(), details)
+	streamManager, err := createStreamingTransferServiceManager(context.Background(), details, nil)
 	require.NoError(t, err)
 	assert.Zero(t, streamManager.GetConfig().GetHttpRetries())
 }
