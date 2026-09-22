@@ -435,6 +435,14 @@ func (tc *TargetClient) eligibleProperties(metadata *SourceFileMetadata, options
 	return eligible, skipped
 }
 
+// HasEligibleProperties reports whether metadata has at least one property eligible for
+// transfer, reusing the same memoized filter result as ApplyProperties instead of re-running
+// filterEligibleProperties.
+func (tc *TargetClient) HasEligibleProperties(metadata *SourceFileMetadata, options TargetDeployOptions) bool {
+	eligible, _ := tc.eligibleProperties(metadata, options)
+	return eligible.KeysLen() > 0
+}
+
 // ReleaseEligibleProperties drops the cached eligible properties for one transfer item.
 // Callers that never reach ApplyProperties should defer this after the metadata pointer is known.
 func (tc *TargetClient) ReleaseEligibleProperties(metadata *SourceFileMetadata, options TargetDeployOptions) {
