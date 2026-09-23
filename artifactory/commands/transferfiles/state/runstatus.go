@@ -15,8 +15,9 @@ import (
 // Can be used to identify when the version of the CLI doesn't support the structure of the transfer directory.
 const transferRunStatusVersion = 1
 
-var saveRunStatusMutex sync.Mutex
+var saveRunStatusMutex sync.RWMutex
 var workingThreadsMutex sync.RWMutex
+var runStatusCountersMutex sync.RWMutex
 
 type ActionOnStatusFunc func(transferRunStatus *TransferRunStatus) error
 
@@ -65,8 +66,10 @@ func (ts *TransferRunStatus) action(action ActionOnStatusFunc) error {
 		return err
 	}
 
-	now := time.Now()
-	if now.Sub(ts.lastSaveTimestamp).Seconds() < float64(stateAndStatusSaveIntervalSecs) {
+	saveRunStatusMutex.RLock()
+	sinceLastSave := time.Since(ts.lastSaveTimestamp).Seconds()
+	saveRunStatusMutex.RUnlock()
+	if sinceLastSave < float64(stateAndStatusSaveIntervalSecs) {
 		return nil
 	}
 
@@ -75,7 +78,7 @@ func (ts *TransferRunStatus) action(action ActionOnStatusFunc) error {
 	}
 	defer saveRunStatusMutex.Unlock()
 
-	ts.lastSaveTimestamp = now
+	ts.lastSaveTimestamp = time.Now()
 	return ts.persistTransferRunStatus()
 }
 
@@ -86,15 +89,16 @@ func (ts *TransferRunStatus) persistTransferRunStatus() (err error) {
 	}
 
 	ts.Version = transferRunStatusVersion
-	// persistTransferRunStatus only runs after action()'s callback has already returned and
-	// saveRunStatusMutex has been acquired (see action() above), so a callback such as
-	// SetWorkingThreads never holds workingThreadsMutex at the same time as saveRunStatusMutex.
-	// Lock order here is saveRunStatusMutex -> workingThreadsMutex -> timeEstimationMutex.
+	// Lock order: saveRunStatusMutex (held by action) -> workingThreadsMutex ->
+	// timeEstimationMutex -> runStatusCountersMutex. Time-estimation code must
+	// not call back into TransferRunStatus.action while locked.
 	content, err := func() ([]byte, error) {
 		workingThreadsMutex.RLock()
 		defer workingThreadsMutex.RUnlock()
 		timeEstimationMutex.RLock()
 		defer timeEstimationMutex.RUnlock()
+		runStatusCountersMutex.RLock()
+		defer runStatusCountersMutex.RUnlock()
 		return json.Marshal(ts)
 	}()
 	if err != nil {

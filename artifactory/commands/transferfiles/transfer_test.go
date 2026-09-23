@@ -25,7 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRunSetup_usesTargetPing_notPluginExecute(t *testing.T) {
+func TestRunSetup_usesTargetPing(t *testing.T) {
 	cleanUpJfrogHome, err := tests.SetJfrogHome()
 	require.NoError(t, err)
 	defer cleanUpJfrogHome()

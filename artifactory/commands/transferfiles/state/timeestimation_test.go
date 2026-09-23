@@ -1,11 +1,11 @@
 package state
 
 import (
-	"github.com/jfrog/gofrog/safeconvert"
 	"testing"
 	"time"
 
 	"github.com/jfrog/build-info-go/utils"
+	"github.com/jfrog/gofrog/safeconvert"
 	rtServicesUtils "github.com/jfrog/jfrog-client-go/artifactory/services/utils"
 
 	"github.com/jfrog/jfrog-cli-core/v2/utils/coreutils"

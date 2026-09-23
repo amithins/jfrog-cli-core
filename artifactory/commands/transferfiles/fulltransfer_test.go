@@ -60,7 +60,7 @@ func (c *folderEnqueueCounter) folderEnqueueCount() int {
 	return c.count
 }
 
-func TestFolderTraversal_schedulesFileTransferNotUploadChunk(t *testing.T) {
+func TestFolderTraversal_schedulesFileTransfer(t *testing.T) {
 	stateManager, cleanUp := state.InitStateTest(t)
 	defer cleanUp()
 
@@ -71,8 +71,7 @@ func TestFolderTraversal_schedulesFileTransferNotUploadChunk(t *testing.T) {
 	}
 
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.RequestURI {
-		case "/api/search/aql":
+		if r.RequestURI == "/api/search/aql" {
 			w.WriteHeader(http.StatusOK)
 			response, _ := json.Marshal(mockAqlResults)
 			_, _ = w.Write(response)
