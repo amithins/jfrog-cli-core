@@ -282,11 +282,20 @@ func TestGetFileMetadata_statsContextCancel_returnsError(t *testing.T) {
 	}
 }
 
-func TestGetFileMetadata_propertiesNotFoundOtherBody_itemGone(t *testing.T) {
+// TestGetFileMetadata_propertiesNotFoundOtherBody_itemStillExists_notGone verifies that an
+// ambiguous properties-404 (a body that isn't the pinned "No properties could be found"
+// string) does NOT get misclassified as a deletion when a corroborating storage-info check
+// finds the item still exists. This is the fix for B-13/B-14/B-20: previously any such 404
+// was silently treated as ErrSourceItemGone, even while the item was confirmed to still be
+// there. The correct outcome is "no properties available" (nil properties, no error), not a
+// silent skip.
+func TestGetFileMetadata_propertiesNotFoundOtherBody_itemStillExists_notGone(t *testing.T) {
 	storagePath := "/api/storage/" + testSourceRelativePath()
+	var storageInfoRequests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == storagePath && r.URL.RawQuery == "":
+			storageInfoRequests++
 			w.WriteHeader(http.StatusOK)
 			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
 				"size": "11",
@@ -294,6 +303,54 @@ func TestGetFileMetadata_propertiesNotFoundOtherBody_itemGone(t *testing.T) {
 					"sha1": "sha1-value",
 				},
 			}))
+		case r.URL.Path == storagePath && r.URL.RawQuery == "properties":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"message":"Not found"}]}`))
+		case r.URL.Path == storagePath && r.URL.RawQuery == "stats":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"message":"Unable to find item"}]}`))
+		default:
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewSourceClient(context.Background(), newTestSourceServerDetails(server.URL))
+	require.NoError(t, err)
+
+	metadata, err := client.GetFileMetadata(context.Background(), testSourceFile())
+	require.NoError(t, err)
+	require.NotNil(t, metadata)
+	assert.False(t, IsSourceItemGone(err))
+	assert.Nil(t, metadata.Properties)
+	// Corroborating check must have hit storage-info a second time (once for the initial
+	// fetch, once to confirm the item still exists after the ambiguous properties 404).
+	assert.Equal(t, 2, storageInfoRequests)
+}
+
+// TestGetFileMetadata_propertiesNotFoundOtherBody_itemActuallyGone verifies that when the
+// corroborating storage-info re-check also 404s, the item is correctly classified as gone.
+func TestGetFileMetadata_propertiesNotFoundOtherBody_itemActuallyGone(t *testing.T) {
+	storagePath := "/api/storage/" + testSourceRelativePath()
+	storageInfoCall := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == storagePath && r.URL.RawQuery == "":
+			storageInfoCall++
+			if storageInfoCall == 1 {
+				w.WriteHeader(http.StatusOK)
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+					"size": "11",
+					"checksums": map[string]string{
+						"sha1": "sha1-value",
+					},
+				}))
+				return
+			}
+			// Corroborating re-check: the item is gone by the time properties are fetched.
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"message":"Not found"}]}`))
 		case r.URL.Path == storagePath && r.URL.RawQuery == "properties":
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"errors":[{"message":"Not found"}]}`))
@@ -312,8 +369,13 @@ func TestGetFileMetadata_propertiesNotFoundOtherBody_itemGone(t *testing.T) {
 	assert.True(t, IsSourceItemGone(err))
 }
 
-func TestGetFileMetadata_notFound(t *testing.T) {
+// TestGetFileMetadata_notFound_confirmedByCorroboratingCheck verifies that a storage-info 404
+// is only classified as ErrSourceItemGone once a second, corroborating storage-info request
+// also confirms the item is gone.
+func TestGetFileMetadata_notFound_confirmedByCorroboratingCheck(t *testing.T) {
+	var requests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"errors":[{"message":"Not found"}]}`))
 	}))
@@ -325,6 +387,44 @@ func TestGetFileMetadata_notFound(t *testing.T) {
 	metadata, err := client.GetFileMetadata(context.Background(), testSourceFile())
 	assert.Nil(t, metadata)
 	assert.True(t, IsSourceItemGone(err))
+	assert.Equal(t, 2, requests, "expected the initial storage-info 404 plus one corroborating re-check")
+}
+
+// TestGetFileMetadata_notFound_transient_notGone verifies that a storage-info 404 which does
+// NOT hold up on corroborating re-check (e.g. a transient proxy hiccup) is surfaced as a plain
+// error, not silently classified as a deletion.
+func TestGetFileMetadata_notFound_transient_notGone(t *testing.T) {
+	storagePath := "/api/storage/" + testSourceRelativePath()
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != storagePath || r.URL.RawQuery != "" {
+			t.Errorf("unexpected request: %s", r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		requestCount++
+		if requestCount == 1 {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[{"message":"Not found"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"size": "11",
+			"checksums": map[string]string{
+				"sha1": "sha1-value",
+			},
+		}))
+	}))
+	defer server.Close()
+
+	client, err := NewSourceClient(context.Background(), newTestSourceServerDetails(server.URL))
+	require.NoError(t, err)
+
+	metadata, err := client.GetFileMetadata(context.Background(), testSourceFile())
+	assert.Nil(t, metadata)
+	require.Error(t, err)
+	assert.False(t, IsSourceItemGone(err), "a 404 that doesn't hold up on corroboration must not be classified as a deletion")
 }
 
 func TestGetFileReader_success(t *testing.T) {

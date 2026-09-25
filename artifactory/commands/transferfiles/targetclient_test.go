@@ -18,6 +18,8 @@ import (
 	transferutils "github.com/jfrog/jfrog-cli-core/v2/artifactory/utils"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/config"
 	artifactoryutils "github.com/jfrog/jfrog-client-go/artifactory/services/utils"
+	"github.com/jfrog/jfrog-client-go/auth"
+	"github.com/jfrog/jfrog-client-go/utils/io/httputils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -946,6 +948,103 @@ func TestTargetClient_sendsTargetCredentials(t *testing.T) {
 	for i, auth := range receivedAuth {
 		assert.Equal(t, "Bearer target-secret-token", auth, "request %d", i)
 	}
+}
+
+// TestTargetClient_Put_expiredTokenRejection_returnsPromptlyNoHang exercises the real HTTP path
+// (doManagerPutStream's direct manager.Client().GetHttpClient().GetClient().Do(req) call, which
+// bypasses client-go's JfrogHttpClient.Send* wrapper and therefore its token-refresh
+// pre-request interceptor) to settle the B-22 "expiring token mid-stream deadlocks the copy/PUT
+// goroutines" theory. The target here simulates an Artifactory rejecting a stale, un-refreshed
+// bearer token: it reads none of the request body and immediately responds 401. The reader fed
+// to Put blocks forever on all but its first Read (as a real in-flight GET-stream reader would
+// while more file content is still arriving), so if the PUT path ever waited for the full body to
+// be written before observing the response, this test would hang until its own timeout.
+func TestTargetClient_Put_expiredTokenRejection_returnsPromptlyNoHang(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Deliberately do not read r.Body: an expired/rejected token fails auth before content
+		// processing. Respond immediately, as a real Artifactory 401 would.
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"errors":[{"status":401,"message":"Bad credentials"}]}`))
+	}))
+	defer server.Close()
+
+	details := newTestTargetServerDetails(server.URL)
+	details.AccessToken = "stale-expired-token"
+	client, err := NewTargetClient(context.Background(), details, nil)
+	require.NoError(t, err)
+
+	blockingReader := newBlockingAfterFirstByteReader()
+	metadata := testTargetMetadata()
+	metadata.Size = 10 * 1024 * 1024 // large enough that a body-first client would never finish writing
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Put(context.Background(), metadata, blockingReader, defaultTargetDeployOptions())
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "expired-token PUT must fail cleanly, not succeed")
+		assert.Contains(t, err.Error(), "401")
+	case <-time.After(3 * time.Second):
+		t.Fatal("TargetClient.Put hung instead of returning promptly on a 401 rejection")
+	}
+}
+
+// TestTargetClient_Put_runsPreRequestInterceptors_tokenRefresh verifies the B-22 fix: Put's
+// streaming PUT path (doManagerPutStream) now runs the target's registered pre-request
+// interceptors (the same mechanism client-go's JfrogHttpClient.Send* uses for proactive
+// access/refresh-token renewal) before issuing the raw HTTP request, instead of bypassing them
+// entirely. A custom interceptor rewrites the Authorization header; the test asserts the target
+// server actually observes the rewritten header, not the stale one the client was constructed
+// with.
+func TestTargetClient_Put_runsPreRequestInterceptors_tokenRefresh(t *testing.T) {
+	var observedAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	details := newTestTargetServerDetails(server.URL)
+	details.AccessToken = "stale-expired-token"
+	client, err := NewTargetClient(context.Background(), details, nil)
+	require.NoError(t, err)
+
+	serviceDetails := client.streamServiceManager.GetConfig().GetServiceDetails()
+	serviceDetails.AppendPreRequestFunction(func(_ *auth.CommonConfigFields, httpClientDetails *httputils.HttpClientDetails) error {
+		if httpClientDetails.Headers == nil {
+			httpClientDetails.Headers = map[string]string{}
+		}
+		httpClientDetails.Headers["Authorization"] = "Bearer refreshed-token"
+		return nil
+	})
+
+	metadata := testTargetMetadata()
+	metadata.Size = int64(len("hello world"))
+	err = client.Put(context.Background(), metadata, bytes.NewReader([]byte("hello world")), defaultTargetDeployOptions())
+	require.NoError(t, err)
+
+	assert.Equal(t, "Bearer refreshed-token", observedAuth, "the pre-request interceptor must run before the streaming PUT is sent")
+}
+
+// blockingAfterFirstByteReader yields one byte, then blocks on every subsequent Read until the
+// test process exits, modeling a GET-stream reader that still has much more content pending.
+type blockingAfterFirstByteReader struct {
+	yielded bool
+}
+
+func newBlockingAfterFirstByteReader() *blockingAfterFirstByteReader {
+	return &blockingAfterFirstByteReader{}
+}
+
+func (r *blockingAfterFirstByteReader) Read(p []byte) (int, error) {
+	if !r.yielded && len(p) > 0 {
+		r.yielded = true
+		p[0] = 'x'
+		return 1, nil
+	}
+	select {} // block forever; only a closed underlying connection/context should ever stop the caller
 }
 
 // TestTargetClient_sendsTargetCredentials_putAndPatch complements

@@ -151,7 +151,17 @@ func (sc *SourceClient) fetchFileInfo(ctx context.Context, manager artifactory.A
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrSourceItemGone
+		gone, confirmErr := sc.confirmItemGone(ctx, manager, relativePath)
+		if confirmErr != nil {
+			return nil, confirmErr
+		}
+		if gone {
+			return nil, ErrSourceItemGone
+		}
+		// The initial 404 didn't hold up on a corroborating re-check: the item exists
+		// after all (a transient proxy hiccup, restart window, etc). Surface this as a
+		// plain, retryable error instead of silently treating the file as deleted.
+		return nil, fmt.Errorf("received a 404 from the source storage-info endpoint for %q, but a corroborating existence check found the item still exists; treating this as a transient error, not a deletion", relativePath)
 	}
 	if err = errorutils.CheckResponseStatusWithBody(resp, body, http.StatusOK); err != nil {
 		return nil, err
@@ -175,7 +185,19 @@ func (sc *SourceClient) fetchItemProperties(ctx context.Context, manager artifac
 		if strings.Contains(string(body), "No properties could be found") {
 			return nil, nil
 		}
-		return nil, ErrSourceItemGone
+		// The body didn't match the pinned string (different locale/version, a proxy error
+		// page, ...). Don't trust that alone to mean the item was deleted: corroborate with
+		// a direct existence check before concluding "gone".
+		gone, confirmErr := sc.confirmItemGone(ctx, manager, relativePath)
+		if confirmErr != nil {
+			return nil, confirmErr
+		}
+		if gone {
+			return nil, ErrSourceItemGone
+		}
+		// Item still exists per the corroborating check: this was just an unrecognized
+		// "no properties" response, not a deletion.
+		return nil, nil
 	}
 	if err = errorutils.CheckResponseStatusWithBody(resp, body, http.StatusOK); err != nil {
 		return nil, err
@@ -186,6 +208,24 @@ func (sc *SourceClient) fetchItemProperties(ctx context.Context, manager artifac
 		return nil, errorutils.CheckError(err)
 	}
 	return result, nil
+}
+
+// confirmItemGone issues a fresh storage-info request to corroborate an ambiguous 404
+// seen on another endpoint before the caller finalizes it as a deletion. This guards
+// against a single 404 (from a transient proxy hiccup, a restart window, or an
+// unrecognized error body) being silently mistaken for "item deleted".
+func (sc *SourceClient) confirmItemGone(ctx context.Context, manager artifactory.ArtifactoryServicesManager, relativePath string) (bool, error) {
+	resp, body, err := sendStorageGet(ctx, manager, relativePath, "")
+	if err != nil {
+		return false, err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return true, nil
+	}
+	if err = errorutils.CheckResponseStatusWithBody(resp, body, http.StatusOK); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (sc *SourceClient) fetchItemStatistics(ctx context.Context, manager artifactory.ArtifactoryServicesManager, relativePath string) (*itemStatistics, error) {
