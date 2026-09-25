@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
+	"github.com/jfrog/jfrog-client-go/utils/log"
 )
 
 type fileTransferSource interface {
@@ -77,6 +78,12 @@ func (ft *FileTransfer) ConfigureOptions(options FileTransferOptions) {
 	ft.options = options
 }
 
+// logSourceItemGone records every source-item-gone skip so it's auditable post-run instead
+// of vanishing silently into a "success" summary.
+func logSourceItemGone(candidate api.FileRepresentation, stage string) {
+	log.Warn("Source item no longer exists, skipping:", fileRelativePath(candidate)+". Detected while:", stage)
+}
+
 func (ft *FileTransfer) TransferFile(ctx context.Context, candidate api.FileRepresentation) TransferResult {
 	startTime := time.Now()
 	result := TransferResult{Candidate: candidate, Status: api.Success}
@@ -91,6 +98,7 @@ func (ft *FileTransfer) TransferFile(ctx context.Context, candidate api.FileRepr
 	}
 	if err != nil {
 		if IsSourceItemGone(err) {
+			logSourceItemGone(candidate, "fetching metadata")
 			result.SourceItemGone = true
 			result.Status = api.SkippedSourceItemGone
 			return ft.finalizeResult(result, startTime, nil, candidate)
@@ -123,6 +131,7 @@ func (ft *FileTransfer) TransferFile(ctx context.Context, candidate api.FileRepr
 	if err != nil {
 		closeReadCloser(reader)
 		if IsSourceItemGone(err) {
+			logSourceItemGone(candidate, "reading file content")
 			result.SourceItemGone = true
 			result.Status = api.SkippedSourceItemGone
 			return ft.finalizeResult(result, startTime, metadata, candidate)

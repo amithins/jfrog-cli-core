@@ -103,7 +103,18 @@ func NewTargetClient(ctx context.Context, serverDetails *config.ServerDetails, p
 	if err != nil {
 		return nil, err
 	}
-	streamServiceManager, err := createStreamingTransferServiceManager(ctx, serverDetails, httpClientWithTransport(proxyTransport, 0))
+	streamTransport := proxyTransport
+	if streamTransport == nil {
+		// No --proxy-key configured: build the same bounded-header-wait transport used for the
+		// source streaming client instead of falling through to client-go's default transport,
+		// which has no ResponseHeaderTimeout and would hang indefinitely against a non-responding
+		// target peer.
+		streamTransport, err = newDefaultStreamingTransport(serverDetails)
+		if err != nil {
+			return nil, err
+		}
+	}
+	streamServiceManager, err := createStreamingTransferServiceManager(ctx, serverDetails, httpClientWithTransport(streamTransport, 0))
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +201,18 @@ func doManagerPatch(ctx context.Context, manager artifactory.ArtifactoryServices
 // doManagerPutStream sends a single-attempt streaming PUT bound to ctx. Unlike doManagerPut, it
 // never retries: reader is typically the read side of an io.Pipe fed once from a source GET, and
 // can't be rewound for a second attempt.
+//
+// Unlike doManagerPut/doManagerGet (which go through the ArtifactoryServicesManager's own
+// JfrogHttpClient.Send* methods), this call issues the request via the raw *http.Client so the
+// streaming body can be piped through directly. JfrogHttpClient.Send* runs client-go's
+// pre-request interceptors (which proactively refresh an expiring access/refresh token) before
+// every request; a raw *http.Client.Do call bypasses that entirely, so a long-running transfer
+// whose token expires mid-stream would otherwise fail every subsequent PUT with 401. Run the
+// same interceptors here, against the same httpClientsDetails, before building the request.
 func doManagerPutStream(ctx context.Context, manager artifactory.ArtifactoryServicesManager, fullURL string, reader io.Reader, size int64, httpClientsDetails httputils.HttpClientDetails) (*http.Response, []byte, error) {
+	if err := manager.GetConfig().GetServiceDetails().RunPreRequestFunctions(&httpClientsDetails); err != nil {
+		return nil, nil, err
+	}
 	var reqBody io.Reader = reader
 	if size == 0 {
 		// A non-nil Body of unknown length makes Go emit Transfer-Encoding: chunked even when
