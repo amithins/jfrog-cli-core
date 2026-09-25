@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -612,6 +613,63 @@ func TestGetFileReader_streamSurvivesSlowResponse(t *testing.T) {
 	got, err := io.ReadAll(reader)
 	require.NoError(t, err)
 	assert.Equal(t, fileContent, string(got))
+}
+
+// TestGetFileReader_nonRespondingPeer_boundedByResponseHeaderTimeout reproduces B-17(b): a peer
+// that accepts the TCP connection but never writes any response (unlike a slow-but-responding
+// server, or a connection refused/reset). Without a ResponseHeaderTimeout on the streaming
+// transport, GetFileReader would block forever on such a peer, since the streaming service
+// manager's overall http.Client.Timeout is intentionally 0 (see
+// TestNewSourceClient_streamServiceManagerHasNoOverallTimeoutOrRetries) to allow large file
+// bodies to stream for as long as they need. streamResponseHeaderTimeout is shrunk here so the
+// test doesn't have to wait out the multi-minute production value.
+func TestGetFileReader_nonRespondingPeer_boundedByResponseHeaderTimeout(t *testing.T) {
+	origTimeout := streamResponseHeaderTimeout
+	streamResponseHeaderTimeout = 200 * time.Millisecond
+	defer func() { streamResponseHeaderTimeout = origTimeout }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			// Accept the connection and drain whatever the client sends, but never write a
+			// response and never close the connection - simulating a hung peer.
+			go func(c net.Conn) {
+				buf := make([]byte, 4096)
+				for {
+					if _, readErr := c.Read(buf); readErr != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	client, err := NewSourceClient(context.Background(), newTestSourceServerDetails("http://"+ln.Addr().String()))
+	require.NoError(t, err)
+
+	type result struct {
+		reader io.ReadCloser
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		reader, getErr := client.GetFileReader(context.Background(), testSourceFile())
+		done <- result{reader, getErr}
+	}()
+
+	select {
+	case res := <-done:
+		require.Error(t, res.err, "a non-responding peer must fail once the response-header timeout elapses, not succeed")
+		assert.Nil(t, res.reader)
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetFileReader hung indefinitely against a non-responding peer instead of being bounded by streamResponseHeaderTimeout")
+	}
 }
 
 // TestGetFileReader_contextCancel_abortsRoundTrip verifies that cancelling the caller

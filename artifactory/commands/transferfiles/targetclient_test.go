@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -1482,6 +1483,124 @@ func Test_skipsDownloadStatistics(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, skipsDownloadStatistics(tt.options))
 		})
+	}
+}
+
+// slowReader trickles data out with a delay between chunks, simulating a large upload over a
+// slow network: the total time to write the whole body can vastly exceed streamResponseHeaderTimeout.
+type slowReader struct {
+	data      []byte
+	pos       int
+	chunkSize int
+	delay     time.Duration
+}
+
+func (r *slowReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	time.Sleep(r.delay)
+	n := r.chunkSize
+	if remaining := len(r.data) - r.pos; n > remaining {
+		n = remaining
+	}
+	n = copy(p, r.data[r.pos:r.pos+n])
+	r.pos += n
+	return n, nil
+}
+
+// TestTargetClient_Put_slowLargeUpload_notBoundedByResponseHeaderTimeout answers a direct
+// question about the B-17(b) fix: does bounding ResponseHeaderTimeout break large, slow uploads?
+// Per net/http's own doc for Transport.ResponseHeaderTimeout, the timer only starts "after fully
+// writing the request (including its body, if any)" - so a slow but steadily-progressing upload,
+// whose total wall-clock time is many multiples of streamResponseHeaderTimeout, must still
+// succeed as long as the target responds promptly once the body is fully received. Only a peer
+// that stalls AFTER receiving the full body (or before starting to respond at all) should trip
+// the timeout - that scenario is covered separately by
+// TestTargetClient_Put_nonRespondingPeer_boundedByResponseHeaderTimeout.
+func TestTargetClient_Put_slowLargeUpload_notBoundedByResponseHeaderTimeout(t *testing.T) {
+	origTimeout := streamResponseHeaderTimeout
+	streamResponseHeaderTimeout = 150 * time.Millisecond
+	defer func() { streamResponseHeaderTimeout = origTimeout }()
+
+	deployPath := "/" + testTargetRelativePath()
+	var receivedLen int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, deployPath) {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		receivedLen = len(body)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
+	require.NoError(t, err)
+
+	// 20 chunks x 40ms = ~800ms total upload time - more than 5x streamResponseHeaderTimeout
+	// (150ms), yet the upload never stalls, so it must succeed.
+	payload := bytes.Repeat([]byte("x"), 200)
+	reader := &slowReader{data: payload, chunkSize: 10, delay: 40 * time.Millisecond}
+
+	start := time.Now()
+	metadata := testTargetMetadata()
+	metadata.Properties = nil // avoid a matrix-param suffix on the deploy path
+	metadata.Size = int64(len(payload))
+	err = client.Put(context.Background(), metadata, reader, defaultTargetDeployOptions())
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "a slow-but-steady large upload must not be cut short by streamResponseHeaderTimeout")
+	assert.Equal(t, len(payload), receivedLen)
+	assert.Greater(t, elapsed, 5*streamResponseHeaderTimeout, "sanity check: the upload should genuinely have taken longer than the response-header timeout")
+}
+
+// TestTargetClient_Put_nonRespondingPeer_boundedByResponseHeaderTimeout is the target-side
+// counterpart of B-17(b) (see sourceclient_test.go's
+// TestGetFileReader_nonRespondingPeer_boundedByResponseHeaderTimeout): without --proxy-key,
+// NewTargetClient used to fall through to client-go's default transport for the streaming PUT
+// path, which has no ResponseHeaderTimeout. A target peer that accepts the connection but never
+// writes a response would hang the PUT indefinitely.
+func TestTargetClient_Put_nonRespondingPeer_boundedByResponseHeaderTimeout(t *testing.T) {
+	origTimeout := streamResponseHeaderTimeout
+	streamResponseHeaderTimeout = 200 * time.Millisecond
+	defer func() { streamResponseHeaderTimeout = origTimeout }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				buf := make([]byte, 4096)
+				for {
+					if _, readErr := c.Read(buf); readErr != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails("http://"+ln.Addr().String()), nil)
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Put(context.Background(), testTargetMetadata(), strings.NewReader("hello world"), defaultTargetDeployOptions())
+	}()
+
+	select {
+	case err := <-done:
+		assert.Error(t, err, "a non-responding target peer must fail once the response-header timeout elapses, not hang or succeed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Put hung indefinitely against a non-responding target peer instead of being bounded by streamResponseHeaderTimeout")
 	}
 }
 

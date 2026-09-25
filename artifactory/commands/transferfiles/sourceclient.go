@@ -69,7 +69,11 @@ func NewSourceClient(ctx context.Context, serverDetails *config.ServerDetails) (
 	if err != nil {
 		return nil, err
 	}
-	streamServiceManager, err := createStreamingTransferServiceManager(ctx, serverDetails, nil)
+	streamTransport, err := newDefaultStreamingTransport(serverDetails)
+	if err != nil {
+		return nil, err
+	}
+	streamServiceManager, err := createStreamingTransferServiceManager(ctx, serverDetails, httpClientWithTransport(streamTransport, 0))
 	if err != nil {
 		return nil, err
 	}

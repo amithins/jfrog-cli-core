@@ -103,7 +103,18 @@ func NewTargetClient(ctx context.Context, serverDetails *config.ServerDetails, p
 	if err != nil {
 		return nil, err
 	}
-	streamServiceManager, err := createStreamingTransferServiceManager(ctx, serverDetails, httpClientWithTransport(proxyTransport, 0))
+	streamTransport := proxyTransport
+	if streamTransport == nil {
+		// No --proxy-key configured: build the same bounded-header-wait transport used for the
+		// source streaming client instead of falling through to client-go's default transport,
+		// which has no ResponseHeaderTimeout and would hang indefinitely against a non-responding
+		// target peer.
+		streamTransport, err = newDefaultStreamingTransport(serverDetails)
+		if err != nil {
+			return nil, err
+		}
+	}
+	streamServiceManager, err := createStreamingTransferServiceManager(ctx, serverDetails, httpClientWithTransport(streamTransport, 0))
 	if err != nil {
 		return nil, err
 	}
