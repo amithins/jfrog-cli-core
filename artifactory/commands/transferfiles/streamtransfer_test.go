@@ -138,7 +138,7 @@ func TestStreamGetToPut_cancel_withCtxBlindSourceAndRealTargetPut(t *testing.T) 
 	}))
 	defer targetServer.Close()
 
-	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(targetServer.URL))
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(targetServer.URL), nil)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
