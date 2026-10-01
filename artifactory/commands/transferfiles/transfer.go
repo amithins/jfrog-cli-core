@@ -15,6 +15,7 @@ import (
 
 	"github.com/jfrog/gofrog/safeconvert"
 	"github.com/jfrog/gofrog/version"
+	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/state"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/utils/precheckrunner"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/utils"
@@ -378,6 +379,8 @@ func (tdc *TransferFilesCommand) initStateManager(allSourceLocalRepos, sourceBui
 		tdc.stateManager.TransferFailures = 0
 		tdc.stateManager.DelayedFiles = 0
 	}
+	// Counted per run (the skipped rows themselves stay in the errors files).
+	tdc.stateManager.SkippedSourceGone = 0
 	return nil
 }
 
@@ -577,14 +580,18 @@ func (tdc *TransferFilesCommand) initTransferDir() error {
 func (tdc *TransferFilesCommand) removeOldFilesIfNeeded(repos []string) error {
 	// If we ignore the old state, we need to remove all the old unused files so the process can start clean
 	if tdc.ignoreState {
-		errFiles, err := getErrorsFiles(repos, true)
-		if err != nil {
-			return err
-		}
-		for _, file := range errFiles {
-			err = os.Remove(file)
+		// Both the retryable and the skipped errors of previous runs: stale skipped rows (e.g. items
+		// that vanished from the source) would otherwise reappear in the errors CSV of a clean run.
+		for _, isRetry := range []bool{true, false} {
+			errFiles, err := getErrorsFiles(repos, isRetry)
 			if err != nil {
-				return errorutils.CheckError(err)
+				return err
+			}
+			for _, file := range errFiles {
+				err = os.Remove(file)
+				if err != nil {
+					return errorutils.CheckError(err)
+				}
 			}
 		}
 		delayFiles, err := getDelayFiles(repos)
@@ -789,6 +796,10 @@ func (tdc *TransferFilesCommand) cleanup(originalErr error, sourceRepos []string
 	// Transferring finished successfully
 	if originalErr == nil {
 		log.Info("Files transfer is complete!")
+	}
+	// Items whose source vanished are skipped without failing the run; make the count visible.
+	if skippedGone := takeSourceItemGoneSkipCount(); skippedGone > 0 {
+		log.Warn(fmt.Sprintf("%d item(s) were skipped because they no longer exist in the source (deleted during the transfer). They are listed in the errors summary CSV with status %s and will not be retried automatically; verify they were really deleted.", skippedGone, api.SkippedSourceItemGone))
 	}
 	if tdc.stateManager.CurrentRepo.Name != "" {
 		e := tdc.stateManager.SaveStateAndSnapshots()

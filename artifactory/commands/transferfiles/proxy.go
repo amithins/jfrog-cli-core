@@ -183,20 +183,37 @@ func redactProxyKey(raw string) string {
 }
 
 func newTargetProxyTransport(proxyURL *url.URL, serverDetails *config.ServerDetails) (http.RoundTripper, error) {
+	transport, err := newStreamingTransport(serverDetails, "--proxy-key")
+	if err != nil {
+		return nil, err
+	}
+	transport.Proxy = http.ProxyURL(proxyURL)
+	return transport, nil
+}
+
+// newDefaultStreamingTransport builds the same bounded-header-wait transport as
+// newTargetProxyTransport, but without a --proxy-key override, for the common (no target proxy
+// configured) case. Used so the source and target streaming clients always get a
+// ResponseHeaderTimeout, not just when --proxy-key is set.
+func newDefaultStreamingTransport(serverDetails *config.ServerDetails) (http.RoundTripper, error) {
+	return newStreamingTransport(serverDetails, "streaming client")
+}
+
+func newStreamingTransport(serverDetails *config.ServerDetails, usageContext string) (*http.Transport, error) {
 	insecureTls := false
 	if serverDetails != nil {
 		insecureTls = serverDetails.InsecureTls
 	}
 	transport := newDefaultTargetTransport()
-	transport.Proxy = http.ProxyURL(proxyURL)
+	transport.ResponseHeaderTimeout = streamResponseHeaderTimeout
 
 	certsPath, err := coreutils.GetJfrogCertsDir()
 	if err != nil {
-		return nil, fmt.Errorf("failed resolving JFrog certs dir for --proxy-key: %w", err)
+		return nil, fmt.Errorf("failed resolving JFrog certs dir for %s: %w", usageContext, err)
 	}
 	transport, err = cert.GetTransportWithLoadedCert(certsPath, insecureTls, transport)
 	if err != nil {
-		return nil, fmt.Errorf("failed loading TLS certs for --proxy-key: %w", err)
+		return nil, fmt.Errorf("failed loading TLS certs for %s: %w", usageContext, err)
 	}
 	if serverDetails != nil {
 		err = httpclient.ClientBuilder().
@@ -204,7 +221,7 @@ func newTargetProxyTransport(proxyURL *url.URL, serverDetails *config.ServerDeta
 			SetClientCertKeyPath(serverDetails.ClientCertKeyPath).
 			AddClientCertToTransport(transport)
 		if err != nil {
-			return nil, fmt.Errorf("failed loading client certificate for --proxy-key: %w", err)
+			return nil, fmt.Errorf("failed loading client certificate for %s: %w", usageContext, err)
 		}
 	}
 	// GetTransportWithLoadedCert replaces TLSClientConfig and drops MinVersion.

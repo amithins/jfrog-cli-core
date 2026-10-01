@@ -43,6 +43,7 @@ type TransferRunStatus struct {
 	VisitedFolders        uint64 `json:"visited_folders,omitempty"`
 	DelayedFiles          uint64 `json:"delayed_files,omitempty"`
 	TransferFailures      uint64 `json:"transfer_failures,omitempty"`
+	SkippedSourceGone     uint64 `json:"skipped_source_gone,omitempty"`
 	TimeEstimationManager `json:"time_estimation,omitempty"`
 	// StaleChunks is retained for on-disk run-status.json schema compatibility.
 	// GET/PUT transfer no longer tracks stale plugin chunks.

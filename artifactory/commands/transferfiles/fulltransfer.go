@@ -11,6 +11,7 @@ import (
 	"github.com/jfrog/gofrog/parallel"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/state"
+	coreutils "github.com/jfrog/jfrog-cli-core/v2/artifactory/utils"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/reposnapshot"
 	servicesUtils "github.com/jfrog/jfrog-client-go/artifactory/services/utils"
 	clientUtils "github.com/jfrog/jfrog-client-go/utils"
@@ -160,6 +161,7 @@ func (m *fullTransferPhase) runWithAqlPatternFiltering() error {
 			if len(result) == 0 {
 				if paginationOffset == 0 {
 					log.Info("No files found matching the include patterns")
+					m.warnIfRepoAppearsBlackedOut("the include-pattern AQL query")
 				}
 				break
 			}
@@ -202,6 +204,29 @@ func (m *fullTransferPhase) getPatternMatchingFiles(paginationOffset int) (resul
 	lastPage = len(aqlResults.Results) < AqlPaginationLimit
 	result, err = m.locallyGeneratedFilter.FilterLocallyGenerated(aqlResults.Results, m.packageType)
 	return
+}
+
+// warnIfRepoAppearsBlackedOut logs a warning when the repository's own summary (fetched once,
+// upfront, via GetRepoSummary at repo-transfer start) reports it holds files, but a query that
+// should have covered the whole repository (queryDescription) returned zero results. Artifactory's
+// AQL endpoint silently filters out items the querying identity can't read, returning an empty
+// result set (HTTP 200) rather than an error - which looks identical to a genuinely empty
+// repository. This does not fail or retry the transfer (an empty repo, or a repo whose files were
+// all legitimately deleted since the summary was fetched, are both real possibilities too); it
+// only surfaces the ambiguity so operators can audit a suspicious zero-file result instead of
+// silently trusting it.
+func (m *fullTransferPhase) warnIfRepoAppearsBlackedOut(queryDescription string) {
+	filesCount, err := coreutils.GetFilesCountFromRepositorySummary(&m.repoSummary)
+	if err != nil || filesCount <= 0 {
+		return
+	}
+	log.Warn(fmt.Sprintf(
+		"Repository '%s' reports %d file(s) in its summary, but %s returned zero results. "+
+			"Artifactory's AQL endpoint returns an empty result set (not an error) when the transferring "+
+			"identity lacks read permission on a repository or path, which is indistinguishable from a "+
+			"genuinely empty repository. If this repository unexpectedly transfers 0 files, verify the "+
+			"transferring user's read permissions on '%s' before trusting this run's result.",
+		m.repoKey, filesCount, queryDescription, m.repoKey))
 }
 
 type folderFullTransferHandlerFunc func(params folderParams) parallel.TaskFunc
@@ -270,6 +295,9 @@ func (m *fullTransferPhase) searchAndHandleFolderContents(params folderParams, p
 
 		// Empty folder
 		if paginationI == 0 && len(result) == 0 {
+			if params.relativePath == "." {
+				m.warnIfRepoAppearsBlackedOut("the repository root folder listing")
+			}
 			return
 		}
 

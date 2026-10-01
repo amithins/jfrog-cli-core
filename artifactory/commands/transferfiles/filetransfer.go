@@ -5,9 +5,11 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
+	"github.com/jfrog/jfrog-client-go/utils/log"
 )
 
 type fileTransferSource interface {
@@ -51,6 +53,8 @@ func (r TransferResult) ToFileUploadStatus() api.FileUploadStatusResponse {
 	}
 	if r.Err != nil {
 		status.Reason = r.Err.Error()
+	} else if r.SourceItemGone {
+		status.Reason = ErrSourceItemGone.Error()
 	}
 	return status
 }
@@ -77,6 +81,23 @@ func (ft *FileTransfer) ConfigureOptions(options FileTransferOptions) {
 	ft.options = options
 }
 
+// sourceItemGoneSkipCount counts items skipped as "source item gone" during this run, so the
+// end-of-run summary can tell the user how many were skipped.
+var sourceItemGoneSkipCount atomic.Int64
+
+// takeSourceItemGoneSkipCount returns the number of items skipped as "source item gone" since
+// the last call, and resets the counter.
+func takeSourceItemGoneSkipCount() int64 {
+	return sourceItemGoneSkipCount.Swap(0)
+}
+
+// logSourceItemGone records every source-item-gone skip so it's auditable post-run instead
+// of vanishing silently into a "success" summary.
+func logSourceItemGone(candidate api.FileRepresentation, stage string) {
+	sourceItemGoneSkipCount.Add(1)
+	log.Warn("Source item no longer exists, skipping:", fileRelativePath(candidate)+". Detected while:", stage)
+}
+
 func (ft *FileTransfer) TransferFile(ctx context.Context, candidate api.FileRepresentation) TransferResult {
 	startTime := time.Now()
 	result := TransferResult{Candidate: candidate, Status: api.Success}
@@ -91,6 +112,7 @@ func (ft *FileTransfer) TransferFile(ctx context.Context, candidate api.FileRepr
 	}
 	if err != nil {
 		if IsSourceItemGone(err) {
+			logSourceItemGone(candidate, "fetching metadata")
 			result.SourceItemGone = true
 			result.Status = api.SkippedSourceItemGone
 			return ft.finalizeResult(result, startTime, nil, candidate)
@@ -123,6 +145,7 @@ func (ft *FileTransfer) TransferFile(ctx context.Context, candidate api.FileRepr
 	if err != nil {
 		closeReadCloser(reader)
 		if IsSourceItemGone(err) {
+			logSourceItemGone(candidate, "reading file content")
 			result.SourceItemGone = true
 			result.Status = api.SkippedSourceItemGone
 			return ft.finalizeResult(result, startTime, metadata, candidate)
