@@ -403,7 +403,10 @@ func ChmodPluginsDirectoryContent() error {
 		return err
 	}
 	for _, p := range plugins {
-		err = os.Chmod(filepath.Join(pluginsDir, p.Name()), 0777)
+		// 0755, not 0777: these are directories holding plugin executables the CLI runs
+		// unconditionally on every invocation (see plugins/utils/signatureutils.go in
+		// jfrog-cli), so they must not be writable by any local account other than the owner.
+		err = os.Chmod(filepath.Join(pluginsDir, p.Name()), 0755)
 		if err != nil {
 			return err
 		}

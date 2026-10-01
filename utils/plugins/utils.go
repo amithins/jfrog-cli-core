@@ -40,7 +40,18 @@ func CheckPluginsVersionAndConvertIfNeeded() (err error) {
 		return
 	}
 
-	return readPluginsConfigAndConvertV0tToV1IfNeeded()
+	if err = readPluginsConfigAndConvertV0tToV1IfNeeded(); err != nil {
+		return err
+	}
+
+	// This function runs on every jf invocation (see plugins/utils/signatureutils.go in
+	// jfrog-cli), not only when a V0->V1 migration actually happens. Without this, an
+	// already-V1 installation that predates the 0755 fix (ChmodPluginsDirectoryContent is
+	// otherwise only called from the migration path above and from a plugin install/update)
+	// would keep its world-writable plugin directories indefinitely, unless the user happens
+	// to install or update a plugin again. Re-applying this on every call is cheap - a
+	// handful of os.Chmod calls - next to the signature-fetching this is already part of.
+	return coreutils.ChmodPluginsDirectoryContent()
 }
 
 func readPluginsConfigAndConvertV0tToV1IfNeeded() (err error) {
@@ -141,7 +152,9 @@ func convertFileSystemLayoutV0ToV1() error {
 		// Move plugins exec files inside a directory, which has the plugin's name.
 		// Create a directory with the plugin's name + "_dir" extension, move the file inside and change directory's name back to plugin's name only.
 		pluginDirPathWithExtension := filepath.Join(pluginsDir, pluginsName+"_dir")
-		err = os.MkdirAll(filepath.Join(pluginDirPathWithExtension, coreutils.PluginsExecDirName), 0777)
+		// 0755, not 0777: this is a plugin's executable directory, and ChmodPluginsDirectoryContent()
+		// below re-applies the same restricted mode after the move - keep both consistent.
+		err = os.MkdirAll(filepath.Join(pluginDirPathWithExtension, coreutils.PluginsExecDirName), 0755)
 		if err != nil {
 			return errorutils.CheckError(err)
 		}
@@ -192,7 +205,9 @@ func getPluginsFilePath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	err = os.MkdirAll(pluginsFilePath, 0777)
+	// 0755, not 0777: same reasoning as the plugin directories below - umask would normally
+	// mask this down anyway, but an explicit mode doesn't depend on the umask being set.
+	err = os.MkdirAll(pluginsFilePath, 0755)
 	if err != nil {
 		return "", err
 	}
