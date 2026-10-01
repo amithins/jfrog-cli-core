@@ -10,17 +10,21 @@ permissions:
 jobs:
   update-dependencies:
     name: Update JFrog Dependencies
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Generate timestamp
         id: timestamp
         run: echo "timestamp=$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
 
       - name: Checkout main branch
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           ref: master
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # GitHub-hosted images ship Go; the GHES runner images don't.
+      - name: Setup Go
+        uses: JFROG/.github/actions/install-go-with-cache@master
 
       - name: Create and checkout new branch
         id: branch

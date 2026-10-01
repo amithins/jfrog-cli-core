@@ -1,0 +1,38 @@
+# Internal (github.jfrog.info) only: thin caller of the org-maintained Frogbot workflow (OIDC auth,
+# runner from the RUNNER_LABEL repo variable). This file cannot load on github.com, where Frogbot
+# runs from build-gate.yml -> frogbot-scan-pull-request.yml instead; exclude it when syncing to public.
+name: "Frogbot Security Scan"
+on:
+  workflow_dispatch:
+    inputs:
+      frogbot_scan_config:
+        description: 'Scanner set as JSON, e.g. {"sast":true,"secrets":true}. Blank = repo var FROGBOT_SCAN_CONFIG.'
+        type: string
+        default: ""
+  push:
+    branches: [ master ]
+    paths-ignore: [ "**.md" ]
+  pull_request:
+    branches: [ master ]
+    types: [ opened, synchronize, reopened ]
+    paths-ignore: [ "**.md" ]
+  schedule:
+    - cron: "0 0 * * *"
+
+concurrency:
+  group: frogbot-${{ github.ref }}
+  cancel-in-progress: true
+
+# A caller can only forward permissions it was granted itself.
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  frogbot:
+    name: Frogbot Security Scan
+    uses: JFROG/next-gen-ci-reusable/.github/workflows/reusable-frogbot-scan.yml@v4.38.0
+    with:
+      frogbot_scan_config: ${{ inputs.frogbot_scan_config }}

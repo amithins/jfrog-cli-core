@@ -10,11 +10,11 @@ permissions:
 
 jobs:
   dependabot:
-    runs-on: ubuntu-latest
-    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'jfrog/jfrog-cli-core'
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.server_url == 'https://github.com'
     steps:
       - name: Checkout PR code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}

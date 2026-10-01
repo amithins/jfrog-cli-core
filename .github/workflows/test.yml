@@ -4,7 +4,8 @@ on:
   workflow_dispatch:
 jobs:
   test:
-    runs-on: ${{ matrix.os }}-latest
+    # Short OS names are mapped to runner labels via the OS_RUNNER_MAP variable (GHES); unset = GitHub-hosted <os>-latest.
+    runs-on: ${{ fromJSON(vars.OS_RUNNER_MAP || '{}')[matrix.os] || format('{0}-latest', matrix.os) }}
     strategy:
       fail-fast: false
       matrix:
@@ -15,14 +16,14 @@ jobs:
       JFROG_CLI_LOG_LEVEL: "DEBUG"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
           # Safe: this workflow only runs after human approval via the build-gate environment.
           allow-unsafe-pr-checkout: true
 
       - name: Setup Python3
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v6
         with:
           python-version: "3.x"
 
@@ -30,19 +31,61 @@ jobs:
         run: python -m pip install pipenv poetry
 
       - name: Install NuGet
-        uses: nuget/setup-nuget@v4
+        uses: third-party-actions/NuGet-setup-nuget@v2.0.1
         with:
           nuget-version: 6.x
 
+      # Self-hosted runners don't run as root, so the default /usr/share/dotnet isn't writable; install under the temp dir.
       - name: Install dotnet
-        uses: actions/setup-dotnet@v6
+        uses: actions/setup-dotnet@v4
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: "6.x"
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v6
+      # GitHub-hosted images ship Node.js; the GHES runner images don't. setup-node also gives npm a writable global prefix.
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
         with:
-          version: 9
+          node-version: "22"
+
+      - name: Install pnpm
+        run: npm install -g pnpm@9
+
+      # GitHub-hosted images ship Yarn; the GHES runner images don't.
+      - name: Install Yarn
+        run: npm install -g yarn
+
+      # GHES Linux runners have no C compiler, and 'go test -race' needs cgo.
+      - name: Install C toolchain on Ubuntu
+        if: matrix.os == 'ubuntu'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      # The GHES Windows runner has no C compiler either; install MinGW-w64 gcc so 'go test -race' can use cgo.
+      # Chocolatey isn't preinstalled there, so install it first when missing (the runner is admin).
+      - name: Install C toolchain on Windows
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          if (Get-Command gcc -ErrorAction SilentlyContinue) { gcc --version; exit 0 }
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+            Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+            $env:Path += ";$env:ProgramData\chocolatey\bin"
+          }
+          choco install mingw -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bin = "$env:ProgramData\mingw64\mingw64\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:ProgramData\chocolatey\bin"
+          & "$bin\gcc.exe" --version
+
+      # The GHES macOS runner has no unlocked login keychain, so Poetry can't store credentials there.
+      # Use the null keyring, which makes Poetry fall back to its config file as it does on Linux.
+      - name: Disable Python keyring on macOS
+        if: matrix.os == 'macos'
+        run: echo "PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring" >> "$GITHUB_ENV"
 
       # Install Mono on Ubuntu to run nuget.exe (due to this issue on Ubuntu 24 that hasn't been fixed yet - https://github.com/NuGet/setup-nuget/issues/168)
       - name: Install Mono on Ubuntu
@@ -56,7 +99,15 @@ jobs:
           sudo apt-get install -y mono-complete
 
       - name: Setup Go with cache
-        uses: jfrog/.github/actions/install-go-with-cache@main
+        uses: JFROG/.github/actions/install-go-with-cache@master
 
+      # -race needs cgo, i.e. a C compiler (installed above on GHES). Fall back to no -race only if that failed.
       - name: Tests
-        run: go test -v github.com/jfrog/jfrog-cli-core/v2/tests -timeout 0 -race
+        shell: bash
+        run: |
+          race=-race
+          if [ "$(go env CGO_ENABLED)" != "1" ]; then
+            echo "::warning::cgo is unavailable (no C compiler); running tests without -race."
+            race=
+          fi
+          go test -v github.com/jfrog/jfrog-cli-core/v2/tests -timeout 0 $race

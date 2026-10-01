@@ -15,7 +15,9 @@ permissions:
   statuses: write
 jobs:
   CLAssistant:
-    runs-on: ubuntu-latest
+    # github.com only: the CLA check is not applicable to the internal GHES mirror.
+    if: github.server_url == 'https://github.com'
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Run CLA Check
         uses: jfrog/.github/actions/cla@main

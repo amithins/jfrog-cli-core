@@ -14,39 +14,39 @@ permissions:
   pull-requests: read
 jobs:
   Static-Check:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
 
       - name: Setup Go with cache
-        uses: jfrog/.github/actions/install-go-with-cache@main
+        uses: JFROG/.github/actions/install-go-with-cache@master
 
       - name: Run golangci linter
-        uses: jfrog/.github/actions/golangci-lint@main
+        uses: JFROG/.github/actions/golangci-lint@master
 
   Go-Sec:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
           fetch-depth: 0
 
       - name: Setup Go with cache
-        uses: jfrog/.github/actions/install-go-with-cache@main
+        uses: JFROG/.github/actions/install-go-with-cache@master
 
       - name: Run Go-Sec scanner
-        uses: jfrog/.github/actions/gosec-scanner@main
+        uses: JFROG/.github/actions/gosec-scanner@master
 
   No-Replace:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout Source
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
 
@@ -62,28 +62,62 @@ jobs:
 
   Validate-CLI-Compatibility:
     name: Validate ${{ matrix.repo }} Compatibility
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # public: true clones from public github.com instead of the current server, for repos
+          # not yet available on GHES. Flip to false once the repo is migrated.
           - repo: jfrog-cli-security
             branch: dev
+            public: true
           - repo: jfrog-cli-artifactory
             branch: main
+            public: false
 
     steps:
       - name: Checkout CLI Core Source
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.ref }}
 
+      # On GHES the sibling repos are internal, so the job's github.token (scoped to this repo) gets 404.
+      # Mint a cross-repo token from the org's GitHub App (org variable + org secret; both absent on
+      # github.com, where the step is skipped and github.token reads the public repos as before).
+      - name: Generate cross-repo token
+        id: app-token
+        if: vars.CROSS_REPO_TOKEN_APP_ID != '' && !matrix.public
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.CROSS_REPO_TOKEN_APP_ID }}
+          private-key: ${{ secrets.CROSS_REPO_TOKEN_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # Only the repository this matrix leg checks out, read-only.
+          repositories: ${{ matrix.repo }}
+          permission-contents: read
+
       - name: Checkout ${{ matrix.repo }} Source - ${{ matrix.branch }} branch
-        uses: actions/checkout@v7
+        if: ${{ !matrix.public }}
+        uses: actions/checkout@v4
         with:
           repository: jfrog/${{ matrix.repo }}
           ref: ${{ matrix.branch }}
           path: ${{ matrix.repo }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      # Tokenless clone: actions/checkout would send this server's token to github.com, which
+      # rejects it even for public repos.
+      - name: Checkout ${{ matrix.repo }} Source (public github.com) - ${{ matrix.branch }} branch
+        if: ${{ matrix.public }}
+        run: git clone --depth 1 --branch ${{ matrix.branch }} https://github.com/jfrog/${{ matrix.repo }}.git ${{ matrix.repo }}
+
+      # GitHub-hosted images ship Go; the GHES runner images don't. Use the Go version the
+      # checked-out repo declares, since it may be newer than this repo's.
+      - name: Setup Go
+        uses: JFROG/.github/actions/install-go-with-cache@master
+        with:
+          go-version-file: ${{ matrix.repo }}/go.mod
 
       - name: Replace To Local Core in ${{ matrix.repo }}
         run: |

@@ -10,13 +10,13 @@ on:
     - cron: "0 0 * * *" # Runs once a day at midnight
 jobs:
   monitor-issues-and-pull-requests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-latest' }}
     permissions:
       actions: write
       issues: write
       pull-requests: write
     steps:
-      - uses: actions/stale@v11
+      - uses: actions/stale@v9
         with:
           # Days of inactivity before marking an issue as stale
           days-before-stale: 180
