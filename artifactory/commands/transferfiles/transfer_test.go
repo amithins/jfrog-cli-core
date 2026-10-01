@@ -3,6 +3,7 @@ package transferfiles
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -322,6 +323,63 @@ func TestCreateErrorsSummaryFile(t *testing.T) {
 	expectedFileErrors := new([]api.FileUploadStatusResponse)
 	assert.NoError(t, gocsv.UnmarshalFile(expectedFile, expectedFileErrors))
 	assert.ElementsMatch(t, *expectedFileErrors, *actualFileErrors)
+}
+
+// TestRemoveOldFilesIfNeeded_ignoreState_clearsSkippedErrors: --ignore-state starts clean, so the
+// skipped-errors rows of earlier runs (e.g. "source item gone") must go too; otherwise a clean rerun
+// reports stale rows in its errors CSV (M1).
+func TestRemoveOldFilesIfNeeded_ignoreState_clearsSkippedErrors(t *testing.T) {
+	for _, ignoreState := range []bool{true, false} {
+		t.Run(fmt.Sprintf("ignoreState=%v", ignoreState), func(t *testing.T) {
+			cleanUpJfrogHome, err := tests.SetJfrogHome()
+			require.NoError(t, err)
+			defer cleanUpJfrogHome()
+			writeErrorRows(t, testRepoKey, 1, goneRow(testRepoKey, "a.bin"), api.FileUploadStatusResponse{
+				FileRepresentation: api.FileRepresentation{Repo: testRepoKey, Path: "path", Name: "failed.bin"}, Status: api.Fail, Reason: "boom"})
+
+			cmd, err := NewTransferFilesCommand(nil, nil)
+			require.NoError(t, err)
+			cmd.ignoreState = ignoreState
+			require.NoError(t, cmd.removeOldFilesIfNeeded([]string{testRepoKey}))
+
+			skipped, err := getErrorsFiles([]string{testRepoKey}, false)
+			require.NoError(t, err)
+			retryable, err := getErrorsFiles([]string{testRepoKey}, true)
+			require.NoError(t, err)
+			if ignoreState {
+				assert.Empty(t, skipped, "stale skipped rows must be removed")
+				assert.Empty(t, retryable)
+			} else {
+				assert.Len(t, skipped, 1)
+				assert.Len(t, retryable, 1)
+			}
+		})
+	}
+}
+
+// TestCleanup_warnsAboutSourceGoneSkips covers the end-of-run Warn: the count of items skipped
+// because they vanished from the source is reported once and then reset.
+func TestCleanup_warnsAboutSourceGoneSkips(t *testing.T) {
+	cleanUpJfrogHome, err := tests.SetJfrogHome()
+	require.NoError(t, err)
+	defer cleanUpJfrogHome()
+	takeSourceItemGoneSkipCount()
+	buffer, stderrBuffer, previousLog := tests.RedirectLogOutputToBuffer()
+	defer log.SetLogger(previousLog)
+
+	cmd, err := NewTransferFilesCommand(nil, nil)
+	require.NoError(t, err)
+	logSourceItemGone(api.FileRepresentation{Repo: "r", Path: "p", Name: "a"}, "test")
+	logSourceItemGone(api.FileRepresentation{Repo: "r", Path: "p", Name: "b"}, "test")
+	require.NoError(t, cmd.cleanup(nil, []string{}))
+	out := buffer.String() + stderrBuffer.String()
+	assert.Contains(t, out, "2 item(s) were skipped because they no longer exist in the source")
+	assert.Contains(t, out, string(api.SkippedSourceItemGone))
+
+	buffer.Reset()
+	stderrBuffer.Reset()
+	require.NoError(t, cmd.cleanup(nil, []string{}))
+	assert.NotContains(t, buffer.String()+stderrBuffer.String(), "were skipped because they no longer exist", "the count is reset after being reported")
 }
 
 func TestResolveTimestampFilter(t *testing.T) {

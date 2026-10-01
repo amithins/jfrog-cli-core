@@ -287,6 +287,56 @@ func TestRunWithAqlPatternFilteringPagination(t *testing.T) {
 	assert.Equal(t, 2, aqlCallCount, "AQL should be called twice for two pages")
 }
 
+// TestWarnIfRepoAppearsBlackedOut covers the B-38 fix: an AQL query returning zero results is
+// corroborated against the repo's own GetRepoSummary file count (fetched once at repo-transfer
+// start) before being trusted at face value, since Artifactory's AQL endpoint silently filters
+// out items the querying identity can't read (HTTP 200, empty result set - not an error),
+// which looks identical to a genuinely empty repository.
+func TestWarnIfRepoAppearsBlackedOut(t *testing.T) {
+	t.Run("warns when repo summary reports files but the query found none", func(t *testing.T) {
+		buffer, stderrBuffer, previousLog := tests.RedirectLogOutputToBuffer()
+		defer log.SetLogger(previousLog)
+
+		phase := &fullTransferPhase{
+			phaseBase: phaseBase{
+				repoKey:     "blacked-out-repo",
+				repoSummary: servicesUtils.RepositorySummary{FilesCount: json.Number("42")},
+			},
+		}
+		phase.warnIfRepoAppearsBlackedOut("the include-pattern AQL query")
+
+		output := buffer.String() + stderrBuffer.String()
+		assert.Contains(t, output, "blacked-out-repo")
+		assert.Contains(t, output, "42")
+		assert.Contains(t, output, "read permission")
+	})
+
+	t.Run("no warning when repo summary reports zero files", func(t *testing.T) {
+		buffer, stderrBuffer, previousLog := tests.RedirectLogOutputToBuffer()
+		defer log.SetLogger(previousLog)
+
+		phase := &fullTransferPhase{
+			phaseBase: phaseBase{
+				repoKey:     "genuinely-empty-repo",
+				repoSummary: servicesUtils.RepositorySummary{FilesCount: json.Number("0")},
+			},
+		}
+		phase.warnIfRepoAppearsBlackedOut("the include-pattern AQL query")
+
+		assert.NotContains(t, buffer.String()+stderrBuffer.String(), "read permission")
+	})
+
+	t.Run("no warning when repo summary's file count is unparseable", func(t *testing.T) {
+		buffer, stderrBuffer, previousLog := tests.RedirectLogOutputToBuffer()
+		defer log.SetLogger(previousLog)
+
+		phase := &fullTransferPhase{phaseBase: phaseBase{repoKey: "no-summary-repo"}}
+		phase.warnIfRepoAppearsBlackedOut("the include-pattern AQL query")
+
+		assert.NotContains(t, buffer.String()+stderrBuffer.String(), "read permission")
+	})
+}
+
 func TestMaybeWarnCompletedFolderSkippedWithFilter(t *testing.T) {
 	t.Run("no warning without filter", func(t *testing.T) {
 		buffer, stderrBuffer, previousLog := tests.RedirectLogOutputToBuffer()

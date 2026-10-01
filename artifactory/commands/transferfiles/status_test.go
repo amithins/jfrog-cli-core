@@ -101,6 +101,7 @@ func TestShowStatusDiffPhase(t *testing.T) {
 	assert.Contains(t, results, "Transfer speed:		0.011 MB/s")
 	assert.Contains(t, results, "Estimated time remaining:	Not available yet")
 	assert.Contains(t, results, "Transfer failures:		223 (In Phase 3 and in subsequent executions, we'll retry transferring the failed files)")
+	assert.NotContains(t, results, "Skipped (deleted at source)", "shown only when there are such items")
 
 	// Check repository status
 	assert.Contains(t, results, "Current Repository Status")
@@ -110,6 +111,19 @@ func TestShowStatusDiffPhase(t *testing.T) {
 	assert.NotContains(t, results, "Visited folders")
 	assert.NotContains(t, results, "Storage:			4.9 KiB / 9.8 KiB (50.0%)")
 	assert.NotContains(t, results, "Files:			500 / 10000 (5.0%)")
+}
+
+// TestShowStatus_skippedSourceGone verifies --status surfaces items skipped because they no longer
+// exist in the source, and stays silent when there are none.
+func TestShowStatus_skippedSourceGone(t *testing.T) {
+	buffer, cleanUp := initStatusTest(t)
+	defer cleanUp()
+	createStateManagerWithSkippedGone(t, api.Phase1, false, 39)
+
+	assert.NoError(t, ShowStatus())
+	results := buffer.String()
+	assert.Contains(t, results, "Skipped (deleted at source):")
+	assert.Contains(t, results, "39")
 }
 
 func TestShowBuildInfoRepo(t *testing.T) {
@@ -148,6 +162,12 @@ func TestShowBuildInfoRepo(t *testing.T) {
 // t     - The testing object
 // phase - Phase ID
 func createStateManager(t *testing.T, phase int, buildInfoRepo bool) {
+	createStateManagerWithSkippedGone(t, phase, buildInfoRepo, 0)
+}
+
+// createStateManagerWithSkippedGone is createStateManager with a given number of items skipped
+// because they no longer exist in the source.
+func createStateManagerWithSkippedGone(t *testing.T, phase int, buildInfoRepo bool, skippedGone uint64) {
 	stateManager, err := state.NewTransferStateManager(false)
 	assert.NoError(t, err)
 	assert.NoError(t, stateManager.TryLockTransferStateManager())
@@ -163,6 +183,7 @@ func createStateManager(t *testing.T, phase int, buildInfoRepo bool) {
 	stateManager.VisitedFolders = 15
 	stateManager.DelayedFiles = 20
 	stateManager.TransferFailures = 223
+	stateManager.SkippedSourceGone = skippedGone
 
 	stateManager.LastSpeeds = []float64{12}
 	stateManager.LastSpeedsSum = 12

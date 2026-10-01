@@ -349,6 +349,16 @@ func (ts *TransferStateManager) ChangeTransferFailureCountBy(count uint64, incre
 	})
 }
 
+// IncSkippedSourceGone counts items skipped because they no longer exist in the source.
+func (ts *TransferStateManager) IncSkippedSourceGone(count uint64) error {
+	return ts.action(func(transferRunStatus *TransferRunStatus) error {
+		runStatusCountersMutex.Lock()
+		defer runStatusCountersMutex.Unlock()
+		transferRunStatus.SkippedSourceGone += count
+		return nil
+	})
+}
+
 func (ts *TransferStateManager) IncRepositoriesTransferred() error {
 	return ts.action(func(transferRunStatus *TransferRunStatus) error {
 		transferRunStatus.TotalRepositories.TransferredUnits++
@@ -465,11 +475,24 @@ func (ts *TransferStateManager) GetRunningTimeString() (runningTime string) {
 func UpdateChunkInState(stateManager *TransferStateManager, chunk *api.ChunkStatus) (err error) {
 	var chunkTotalSizeInBytes int64 = 0
 	var chunkTotalFiles int64 = 0
+	var chunkSkippedGone uint64
 	for _, file := range chunk.Files {
+		if file.Status == api.SkippedSourceItemGone {
+			// The item vanished from the source: it was not transferred, count it separately.
+			if file.Name != "" {
+				chunkSkippedGone++
+			}
+			continue
+		}
 		if file.Status != api.Fail && file.Name != "" {
 			// Count only successfully transferred files
 			chunkTotalSizeInBytes += file.SizeBytes
 			chunkTotalFiles++
+		}
+	}
+	if chunkSkippedGone > 0 {
+		if err = stateManager.IncSkippedSourceGone(chunkSkippedGone); err != nil {
+			return err
 		}
 	}
 	switch stateManager.CurrentRepoPhase {

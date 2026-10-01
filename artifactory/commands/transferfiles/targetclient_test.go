@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -18,6 +19,8 @@ import (
 	transferutils "github.com/jfrog/jfrog-cli-core/v2/artifactory/utils"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/config"
 	artifactoryutils "github.com/jfrog/jfrog-client-go/artifactory/services/utils"
+	"github.com/jfrog/jfrog-client-go/auth"
+	"github.com/jfrog/jfrog-client-go/utils/io/httputils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -948,6 +951,103 @@ func TestTargetClient_sendsTargetCredentials(t *testing.T) {
 	}
 }
 
+// TestTargetClient_Put_expiredTokenRejection_returnsPromptlyNoHang exercises the real HTTP path
+// (doManagerPutStream's direct manager.Client().GetHttpClient().GetClient().Do(req) call, which
+// bypasses client-go's JfrogHttpClient.Send* wrapper and therefore its token-refresh
+// pre-request interceptor) to settle the B-22 "expiring token mid-stream deadlocks the copy/PUT
+// goroutines" theory. The target here simulates an Artifactory rejecting a stale, un-refreshed
+// bearer token: it reads none of the request body and immediately responds 401. The reader fed
+// to Put blocks forever on all but its first Read (as a real in-flight GET-stream reader would
+// while more file content is still arriving), so if the PUT path ever waited for the full body to
+// be written before observing the response, this test would hang until its own timeout.
+func TestTargetClient_Put_expiredTokenRejection_returnsPromptlyNoHang(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Deliberately do not read r.Body: an expired/rejected token fails auth before content
+		// processing. Respond immediately, as a real Artifactory 401 would.
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"errors":[{"status":401,"message":"Bad credentials"}]}`))
+	}))
+	defer server.Close()
+
+	details := newTestTargetServerDetails(server.URL)
+	details.AccessToken = "stale-expired-token"
+	client, err := NewTargetClient(context.Background(), details, nil)
+	require.NoError(t, err)
+
+	blockingReader := newBlockingAfterFirstByteReader()
+	metadata := testTargetMetadata()
+	metadata.Size = 10 * 1024 * 1024 // large enough that a body-first client would never finish writing
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Put(context.Background(), metadata, blockingReader, defaultTargetDeployOptions())
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "expired-token PUT must fail cleanly, not succeed")
+		assert.Contains(t, err.Error(), "401")
+	case <-time.After(3 * time.Second):
+		t.Fatal("TargetClient.Put hung instead of returning promptly on a 401 rejection")
+	}
+}
+
+// TestTargetClient_Put_runsPreRequestInterceptors_tokenRefresh verifies the B-22 fix: Put's
+// streaming PUT path (doManagerPutStream) now runs the target's registered pre-request
+// interceptors (the same mechanism client-go's JfrogHttpClient.Send* uses for proactive
+// access/refresh-token renewal) before issuing the raw HTTP request, instead of bypassing them
+// entirely. A custom interceptor rewrites the Authorization header; the test asserts the target
+// server actually observes the rewritten header, not the stale one the client was constructed
+// with.
+func TestTargetClient_Put_runsPreRequestInterceptors_tokenRefresh(t *testing.T) {
+	var observedAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	details := newTestTargetServerDetails(server.URL)
+	details.AccessToken = "stale-expired-token"
+	client, err := NewTargetClient(context.Background(), details, nil)
+	require.NoError(t, err)
+
+	serviceDetails := client.streamServiceManager.GetConfig().GetServiceDetails()
+	serviceDetails.AppendPreRequestFunction(func(_ *auth.CommonConfigFields, httpClientDetails *httputils.HttpClientDetails) error {
+		if httpClientDetails.Headers == nil {
+			httpClientDetails.Headers = map[string]string{}
+		}
+		httpClientDetails.Headers["Authorization"] = "Bearer refreshed-token"
+		return nil
+	})
+
+	metadata := testTargetMetadata()
+	metadata.Size = int64(len("hello world"))
+	err = client.Put(context.Background(), metadata, bytes.NewReader([]byte("hello world")), defaultTargetDeployOptions())
+	require.NoError(t, err)
+
+	assert.Equal(t, "Bearer refreshed-token", observedAuth, "the pre-request interceptor must run before the streaming PUT is sent")
+}
+
+// blockingAfterFirstByteReader yields one byte, then blocks on every subsequent Read until the
+// test process exits, modeling a GET-stream reader that still has much more content pending.
+type blockingAfterFirstByteReader struct {
+	yielded bool
+}
+
+func newBlockingAfterFirstByteReader() *blockingAfterFirstByteReader {
+	return &blockingAfterFirstByteReader{}
+}
+
+func (r *blockingAfterFirstByteReader) Read(p []byte) (int, error) {
+	if !r.yielded && len(p) > 0 {
+		r.yielded = true
+		p[0] = 'x'
+		return 1, nil
+	}
+	select {} // block forever; only a closed underlying connection/context should ever stop the caller
+}
+
 // TestTargetClient_sendsTargetCredentials_putAndPatch complements
 // TestTargetClient_sendsTargetCredentials, which only exercises Ping (routed through
 // doManagerGet). Put and applyPropertiesViaPatch instead build their requests through
@@ -1383,6 +1483,124 @@ func Test_skipsDownloadStatistics(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, skipsDownloadStatistics(tt.options))
 		})
+	}
+}
+
+// slowReader trickles data out with a delay between chunks, simulating a large upload over a
+// slow network: the total time to write the whole body can vastly exceed streamResponseHeaderTimeout.
+type slowReader struct {
+	data      []byte
+	pos       int
+	chunkSize int
+	delay     time.Duration
+}
+
+func (r *slowReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	time.Sleep(r.delay)
+	n := r.chunkSize
+	if remaining := len(r.data) - r.pos; n > remaining {
+		n = remaining
+	}
+	n = copy(p, r.data[r.pos:r.pos+n])
+	r.pos += n
+	return n, nil
+}
+
+// TestTargetClient_Put_slowLargeUpload_notBoundedByResponseHeaderTimeout answers a direct
+// question about the B-17(b) fix: does bounding ResponseHeaderTimeout break large, slow uploads?
+// Per net/http's own doc for Transport.ResponseHeaderTimeout, the timer only starts "after fully
+// writing the request (including its body, if any)" - so a slow but steadily-progressing upload,
+// whose total wall-clock time is many multiples of streamResponseHeaderTimeout, must still
+// succeed as long as the target responds promptly once the body is fully received. Only a peer
+// that stalls AFTER receiving the full body (or before starting to respond at all) should trip
+// the timeout - that scenario is covered separately by
+// TestTargetClient_Put_nonRespondingPeer_boundedByResponseHeaderTimeout.
+func TestTargetClient_Put_slowLargeUpload_notBoundedByResponseHeaderTimeout(t *testing.T) {
+	origTimeout := streamResponseHeaderTimeout
+	streamResponseHeaderTimeout = 150 * time.Millisecond
+	defer func() { streamResponseHeaderTimeout = origTimeout }()
+
+	deployPath := "/" + testTargetRelativePath()
+	var receivedLen int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, deployPath) {
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		receivedLen = len(body)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails(server.URL), nil)
+	require.NoError(t, err)
+
+	// 20 chunks x 40ms = ~800ms total upload time - more than 5x streamResponseHeaderTimeout
+	// (150ms), yet the upload never stalls, so it must succeed.
+	payload := bytes.Repeat([]byte("x"), 200)
+	reader := &slowReader{data: payload, chunkSize: 10, delay: 40 * time.Millisecond}
+
+	start := time.Now()
+	metadata := testTargetMetadata()
+	metadata.Properties = nil // avoid a matrix-param suffix on the deploy path
+	metadata.Size = int64(len(payload))
+	err = client.Put(context.Background(), metadata, reader, defaultTargetDeployOptions())
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "a slow-but-steady large upload must not be cut short by streamResponseHeaderTimeout")
+	assert.Equal(t, len(payload), receivedLen)
+	assert.Greater(t, elapsed, 5*streamResponseHeaderTimeout, "sanity check: the upload should genuinely have taken longer than the response-header timeout")
+}
+
+// TestTargetClient_Put_nonRespondingPeer_boundedByResponseHeaderTimeout is the target-side
+// counterpart of B-17(b) (see sourceclient_test.go's
+// TestGetFileReader_nonRespondingPeer_boundedByResponseHeaderTimeout): without --proxy-key,
+// NewTargetClient used to fall through to client-go's default transport for the streaming PUT
+// path, which has no ResponseHeaderTimeout. A target peer that accepts the connection but never
+// writes a response would hang the PUT indefinitely.
+func TestTargetClient_Put_nonRespondingPeer_boundedByResponseHeaderTimeout(t *testing.T) {
+	origTimeout := streamResponseHeaderTimeout
+	streamResponseHeaderTimeout = 200 * time.Millisecond
+	defer func() { streamResponseHeaderTimeout = origTimeout }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				buf := make([]byte, 4096)
+				for {
+					if _, readErr := c.Read(buf); readErr != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	client, err := NewTargetClient(context.Background(), newTestTargetServerDetails("http://"+ln.Addr().String()), nil)
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Put(context.Background(), testTargetMetadata(), strings.NewReader("hello world"), defaultTargetDeployOptions())
+	}()
+
+	select {
+	case err := <-done:
+		assert.Error(t, err, "a non-responding target peer must fail once the response-header timeout elapses, not hang or succeed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Put hung indefinitely against a non-responding target peer instead of being bounded by streamResponseHeaderTimeout")
 	}
 }
 
