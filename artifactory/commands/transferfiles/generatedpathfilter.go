@@ -9,6 +9,17 @@ import (
 	"github.com/jfrog/jfrog-client-go/utils/log"
 )
 
+const (
+	// cocoapodsSpecsDir is the hidden index directory Artifactory writes generated podspec
+	// copies to (CocoaPodsConstants.SPECS_PATH in artifactory-service). Real user-uploaded
+	// podspecs live under the repo's visible "Specs/" or "pods/" layout instead.
+	cocoapodsSpecsDir = ".specs"
+	// swiftCacheDir is the hidden cache directory Artifactory writes generated Swift registry
+	// metadata to (SwiftConstants.CACHE_DIRECTORY in artifactory-service). Real uploaded source
+	// archives and package metadata live outside it.
+	swiftCacheDir = ".swift"
+)
+
 var (
 	yumRepodataPattern = regexp.MustCompile(`(^|.*/)repodata($|/.*)`)
 	yumTmpPattern      = regexp.MustCompile(`(^|.*/)_tmp_\d{13,}($|/.*)`)
@@ -60,9 +71,10 @@ func shouldExcludeGeneratedFile(packageType, pathInRepo string) bool {
 	case "nuget":
 		return strings.HasPrefix(pathInRepo, ".nuget") || strings.HasPrefix(pathInRepo, ".nuGetV3/")
 	case "swift":
-		return strings.HasSuffix(pathInRepo, "releases.json") ||
-			strings.HasSuffix(pathInRepo, "release_info.json") ||
-			isSwiftGeneratedManifest(pathInRepo)
+		return isUnderDir(pathInRepo, swiftCacheDir) &&
+			(strings.HasSuffix(pathInRepo, "releases.json") ||
+				strings.HasSuffix(pathInRepo, "release_info.json") ||
+				isSwiftGeneratedManifest(pathInRepo))
 	case "alpine":
 		return strings.HasSuffix(pathInRepo, "APKINDEX.tar.gz")
 	case "debian":
@@ -74,7 +86,8 @@ func shouldExcludeGeneratedFile(packageType, pathInRepo string) bool {
 	case "composer":
 		return isComposerGeneratedPath(pathInRepo)
 	case "cocoapods":
-		return strings.HasSuffix(pathInRepo, ".podspec.json") || strings.HasSuffix(pathInRepo, ".podspec")
+		return isUnderDir(pathInRepo, cocoapodsSpecsDir) &&
+			(strings.HasSuffix(pathInRepo, ".podspec.json") || strings.HasSuffix(pathInRepo, ".podspec"))
 	case "terraform":
 		return strings.HasSuffix(pathInRepo, "module.json")
 	case "releasebundles":
@@ -86,6 +99,13 @@ func shouldExcludeGeneratedFile(packageType, pathInRepo string) bool {
 
 func isInternalMetadataPath(pathInRepo string) bool {
 	return pathInRepo == ".jfrog" || strings.HasPrefix(pathInRepo, ".jfrog/")
+}
+
+// isUnderDir reports whether dir appears as an actual path segment of pathInRepo, rather than
+// merely as a substring, so a hidden generated-file directory (e.g. ".specs", ".swift") never
+// matches a real file that merely happens to contain that text in its name.
+func isUnderDir(pathInRepo, dir string) bool {
+	return pathInRepo == dir || strings.HasPrefix(pathInRepo, dir+"/") || strings.Contains(pathInRepo, "/"+dir+"/")
 }
 
 func isDockerGeneratedPath(pathInRepo string) bool {
