@@ -41,11 +41,17 @@ type transferPhase interface {
 	setMinCheckSumDeploySize(minCheckSumDeploySize int64)
 	setIncludeFilesPatterns(includeFilesPatterns []string)
 	setTimestampFilter(filter *timestampFilter)
+	setFileTransfer(fileTransferExecutor)
 	StopGracefully()
+}
+
+type fileTransferExecutor interface {
+	TransferFile(ctx context.Context, candidate api.FileRepresentation) TransferResult
 }
 
 type phaseBase struct {
 	context                   context.Context
+	fileTransfer              fileTransferExecutor
 	repoKey                   string
 	buildInfoRepo             bool
 	packageType               string
@@ -99,6 +105,10 @@ func (pb *phaseBase) getSourceDetails() *coreConfig.ServerDetails {
 
 func (pb *phaseBase) setContext(context context.Context) {
 	pb.context = context
+}
+
+func (pb *phaseBase) setFileTransfer(executor fileTransferExecutor) {
+	pb.fileTransfer = executor
 }
 
 func (pb *phaseBase) setRepoKey(repoKey string) {

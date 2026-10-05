@@ -33,7 +33,6 @@ func newTransferManager(base phaseBase, delayUploadComparisonFunctions []shouldD
 
 type transferActionWithProducerConsumerType func(
 	pcWrapper *producerConsumerWrapper,
-	uploadChunkChan chan UploadedChunk,
 	delayHelper delayUploadHelper,
 	errorsChannelMng *ErrorsChannelMng) error
 
@@ -101,7 +100,7 @@ func (ftm *transferManager) doTransfer(pcWrapper *producerConsumerWrapper, trans
 	}
 	go func() {
 		defer runWaitGroup.Done()
-		actionErr = transferAction(pcWrapper, uploadChunkChan, delayUploadHelper, &errorsChannelMng)
+		actionErr = transferAction(pcWrapper, delayUploadHelper, &errorsChannelMng)
 		if pcWrapper == nil {
 			pollingTasksManager.stop()
 		}
@@ -164,7 +163,7 @@ func (ptm *PollingTasksManager) start(phaseBase *phaseBase, runWaitGroup *sync.W
 	}
 	go func() {
 		defer runWaitGroup.Done()
-		periodicallyUpdateThreadsAndStopStatus(pcWrapper, ptm.doneChannel, phaseBase.buildInfoRepo, phaseBase.stopSignal)
+		periodicallyUpdateThreadsAndStopStatus(pcWrapper, ptm.doneChannel, phaseBase.buildInfoRepo, phaseBase.stateManager, phaseBase.stopSignal)
 	}()
 
 	// Check status of uploaded chunks.

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	buildInfoUtils "github.com/jfrog/build-info-go/utils"
@@ -163,6 +164,10 @@ func (m *InterruptionErr) Error() string {
 
 func createTransferServiceManager(ctx context.Context, serverDetails *config.ServerDetails) (artifactory.ArtifactoryServicesManager, error) {
 	return utils.CreateServiceManagerWithContext(ctx, serverDetails, false, 0, retries, retriesWaitMilliSecs, time.Minute)
+}
+
+func createMetadataTransferServiceManager(ctx context.Context, serverDetails *config.ServerDetails) (artifactory.ArtifactoryServicesManager, error) {
+	return utils.CreateServiceManagerWithContext(ctx, serverDetails, false, 0, metadataTransferRetries, metadataRetryWaitMilliSecs, time.Minute)
 }
 
 func createSrcRtUserPluginServiceManager(ctx context.Context, sourceRtDetails *config.ServerDetails) (*srcUserPluginService, error) {
@@ -339,12 +344,113 @@ func GetChunkUploaderThreads() int {
 	return curChunkUploaderThreads
 }
 
+func transferFileHandler(phaseBase *phaseBase, file api.FileRepresentation, errorsChannelMng *ErrorsChannelMng) parallel.TaskFunc {
+	return func(threadId int) error {
+		logMsgPrefix := clientUtils.GetLogMsgPrefix(threadId, false)
+		log.Debug(logMsgPrefix + "Handling file transfer")
+		if ShouldStop(phaseBase, nil, errorsChannelMng) {
+			return errorutils.CheckErrorf("%sstopped", logMsgPrefix)
+		}
+		result := phaseBase.fileTransfer.TransferFile(phaseBase.context, file)
+		return handleTransferFileResult(phaseBase, result, errorsChannelMng)
+	}
+}
+
+// transferFileResultMutex serializes transfer-state and repository-snapshot updates.
+// It may be held while snapshot/state locks are acquired, but must be released before
+// TimeEstimationManager.AddChunkStatus acquires the time-estimation lock.
+var transferFileResultMutex sync.Mutex
+
+func handleTransferFileResult(phaseBase *phaseBase, result TransferResult, errorsChannelMng *ErrorsChannelMng) error {
+	fileStatus := result.ToFileUploadStatus()
+	if statusMovesNoBytes(result.Status) {
+		fileStatus.SizeBytes = 0
+	}
+	if result.Status == api.Fail || result.Status == api.SkippedLargeProps {
+		if addErrorToChannel(errorsChannelMng, fileStatus) {
+			return errorutils.CheckErrorf("stopped")
+		}
+	}
+	if result.Status == api.Fail {
+		if phaseBase.stateManager != nil {
+			withTransferFileResultLock(func() {
+				if err := setChunkCompletedInRepoSnapshot(phaseBase.stateManager, []api.FileUploadStatusResponse{fileStatus}); err != nil {
+					log.Error(err)
+				}
+			})
+		}
+		return nil
+	}
+	if statusMovesNoBytes(result.Status) {
+		if phaseBase.stateManager != nil {
+			chunk := api.ChunkStatus{Files: []api.FileUploadStatusResponse{fileStatus}}
+			withTransferFileResultLock(func() {
+				if err := state.UpdateChunkInState(phaseBase.stateManager, &chunk); err != nil {
+					log.Error(err)
+				}
+				if err := setChunkCompletedInRepoSnapshot(phaseBase.stateManager, chunk.Files); err != nil {
+					log.Error(err)
+				}
+			})
+		}
+		return nil
+	}
+	if phaseBase.stateManager != nil {
+		chunk := api.ChunkStatus{Files: []api.FileUploadStatusResponse{fileStatus}}
+		withTransferFileResultLock(func() {
+			if err := state.UpdateChunkInState(phaseBase.stateManager, &chunk); err != nil {
+				log.Error(err)
+			}
+			if err := setChunkCompletedInRepoSnapshot(phaseBase.stateManager, chunk.Files); err != nil {
+				log.Error(err)
+			}
+		})
+
+		timeEstMng := &phaseBase.stateManager.TimeEstimationManager
+		if err := timeEstMng.AddChunkStatus(chunk, result.DurationMillis); err != nil {
+			log.Error(err)
+		}
+	}
+	return nil
+}
+
+func withTransferFileResultLock(action func()) {
+	transferFileResultMutex.Lock()
+	defer transferFileResultMutex.Unlock()
+	action()
+}
+
+func statusMovesNoBytes(status api.ChunkFileStatusType) bool {
+	return status == api.SkippedMetadataFile ||
+		status == api.SkippedNonEmptyDir ||
+		status == api.SkippedSourceItemGone
+}
+
+func transferFiles(files []api.FileRepresentation, base phaseBase, delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng, pcWrapper *producerConsumerWrapper) (shouldStop bool, err error) {
+	for _, item := range files {
+		file := item
+		var delayed bool
+		delayed, shouldStop = delayHelper.delayUploadIfNecessary(base, file)
+		if shouldStop {
+			return
+		}
+		if delayed {
+			continue
+		}
+		_, err = pcWrapper.chunkUploaderProducerConsumer.AddTaskWithError(transferFileHandler(&base, file, errorsChannelMng), pcWrapper.errorsQueue.AddError)
+		if err != nil {
+			return
+		}
+	}
+	return
+}
+
 // Periodically reads settings file and updates the number of threads.
 // Number of threads in the settings files is expected to change by running a separate command.
 // The new number of threads should be almost immediately (checked every waitTimeBetweenThreadsUpdateSeconds) reflected on
 // the CLI side (by updating the producer consumer if used and the local variable) and as a result reflected on the Artifactory User Plugin side.
 // This method also looks for '~/.jfrog/transfer/stop' file and interrupts the transfer if exists.
-func periodicallyUpdateThreadsAndStopStatus(pcWrapper *producerConsumerWrapper, doneChan chan bool, buildInfoRepo bool, stopSignal chan os.Signal) {
+func periodicallyUpdateThreadsAndStopStatus(pcWrapper *producerConsumerWrapper, doneChan chan bool, buildInfoRepo bool, stateManager *state.TransferStateManager, stopSignal chan os.Signal) {
 	log.Debug("Initializing polling on the settings and stop files...")
 	for {
 		time.Sleep(waitTimeBetweenThreadsUpdateSeconds * time.Second)
@@ -355,13 +461,13 @@ func periodicallyUpdateThreadsAndStopStatus(pcWrapper *producerConsumerWrapper, 
 			log.Debug("Stopping the polling on the settings and stop files for the current phase.")
 			return
 		}
-		if err := updateThreads(pcWrapper, buildInfoRepo); err != nil {
+		if err := updateThreadsWithState(pcWrapper, buildInfoRepo, stateManager); err != nil {
 			log.Error(err)
 		}
 	}
 }
 
-func updateThreads(pcWrapper *producerConsumerWrapper, buildInfoRepo bool) error {
+func updateThreadsWithState(pcWrapper *producerConsumerWrapper, buildInfoRepo bool, stateManager *state.TransferStateManager) error {
 	settings, err := utils.LoadTransferSettings()
 	if err != nil || settings == nil {
 		return err
@@ -377,6 +483,11 @@ func updateThreads(pcWrapper *producerConsumerWrapper, buildInfoRepo bool) error
 		log.Info(fmt.Sprintf("Number of threads has been updated to %s (was %s).", strconv.Itoa(calculatedChunkUploaderThreads), strconv.Itoa(curChunkUploaderThreads)))
 		curChunkBuilderThreads = calculatedChunkBuilderThreads
 		curChunkUploaderThreads = calculatedChunkUploaderThreads
+		if stateManager != nil {
+			if err = stateManager.SetWorkingThreads(calculatedChunkUploaderThreads); err != nil {
+				return err
+			}
+		}
 	} else {
 		log.Debug(fmt.Sprintf("No change to the number of threads has been detected. Max chunks builder threads: %d. Max chunks uploader threads: %d.",
 			calculatedChunkBuilderThreads, calculatedChunkUploaderThreads))

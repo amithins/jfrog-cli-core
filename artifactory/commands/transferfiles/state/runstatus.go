@@ -16,6 +16,7 @@ import (
 const transferRunStatusVersion = 1
 
 var saveRunStatusMutex sync.Mutex
+var workingThreadsMutex sync.RWMutex
 
 type ActionOnStatusFunc func(transferRunStatus *TransferRunStatus) error
 
@@ -83,7 +84,17 @@ func (ts *TransferRunStatus) persistTransferRunStatus() (err error) {
 	}
 
 	ts.Version = transferRunStatusVersion
-	content, err := json.Marshal(ts)
+	// persistTransferRunStatus only runs after action()'s callback has already returned and
+	// saveRunStatusMutex has been acquired (see action() above), so a callback such as
+	// SetWorkingThreads never holds workingThreadsMutex at the same time as saveRunStatusMutex.
+	// Lock order here is saveRunStatusMutex -> workingThreadsMutex -> timeEstimationMutex.
+	content, err := func() ([]byte, error) {
+		workingThreadsMutex.RLock()
+		defer workingThreadsMutex.RUnlock()
+		timeEstimationMutex.RLock()
+		defer timeEstimationMutex.RUnlock()
+		return json.Marshal(ts)
+	}()
 	if err != nil {
 		return errorutils.CheckError(err)
 	}

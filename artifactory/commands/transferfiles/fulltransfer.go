@@ -21,7 +21,7 @@ import (
 // Manages the phase of performing a full transfer of the repository.
 // This phase is only executed once per repository if its completed.
 // Transfer is performed by treating every folder as a task, and searching for it's content in a flat AQL.
-// New folders found are handled as a separate task, and files are uploaded in chunks and polled on for status.
+// New folders found are handled as a separate task, and files are transferred directly per file.
 type fullTransferPhase struct {
 	phaseBase
 	transferManager              *transferManager
@@ -109,7 +109,7 @@ func (m *fullTransferPhase) run() error {
 // runWithFolderTraversal uses the traditional folder-by-folder traversal approach.
 // This is the default behavior when no include patterns are specified.
 func (m *fullTransferPhase) runWithFolderTraversal() error {
-	action := func(pcWrapper *producerConsumerWrapper, uploadChunkChan chan UploadedChunk, delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng) error {
+	action := func(pcWrapper *producerConsumerWrapper, delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng) error {
 		if ShouldStop(&m.phaseBase, &delayHelper, errorsChannelMng) {
 			return nil
 		}
@@ -120,7 +120,7 @@ func (m *fullTransferPhase) runWithFolderTraversal() error {
 			return err
 		}
 
-		folderHandler := m.createFolderFullTransferHandlerFunc(node, pcWrapper, uploadChunkChan, delayHelper, errorsChannelMng)
+		folderHandler := m.createFolderFullTransferHandlerFunc(node, pcWrapper, delayHelper, errorsChannelMng)
 		_, err = pcWrapper.chunkBuilderProducerConsumer.AddTaskWithError(folderHandler(folderParams{relativePath: "."}), pcWrapper.errorsQueue.AddError)
 		return err
 	}
@@ -140,7 +140,7 @@ func (m *fullTransferPhase) runWithFolderTraversal() error {
 func (m *fullTransferPhase) runWithAqlPatternFiltering() error {
 	log.Info("Using AQL-based pattern filtering for include patterns:", m.includeFilesPatterns)
 
-	action := func(pcWrapper *producerConsumerWrapper, uploadChunkChan chan UploadedChunk, delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng) error {
+	action := func(pcWrapper *producerConsumerWrapper, delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng) error {
 		if ShouldStop(&m.phaseBase, &delayHelper, errorsChannelMng) {
 			return nil
 		}
@@ -166,7 +166,7 @@ func (m *fullTransferPhase) runWithAqlPatternFiltering() error {
 
 			// Convert results to file representations and upload
 			files := convertResultsToFileRepresentation(result)
-			shouldStop, err := uploadByChunks(files, uploadChunkChan, m.phaseBase, delayHelper, errorsChannelMng, pcWrapper)
+			shouldStop, err := transferFiles(files, m.phaseBase, delayHelper, errorsChannelMng, pcWrapper)
 			if err != nil || shouldStop {
 				return err
 			}
@@ -200,7 +200,7 @@ func (m *fullTransferPhase) getPatternMatchingFiles(paginationOffset int) (resul
 	}
 
 	lastPage = len(aqlResults.Results) < AqlPaginationLimit
-	result, err = m.locallyGeneratedFilter.FilterLocallyGenerated(aqlResults.Results)
+	result, err = m.locallyGeneratedFilter.FilterLocallyGenerated(aqlResults.Results, m.packageType)
 	return
 }
 
@@ -210,18 +210,18 @@ type folderParams struct {
 	relativePath string
 }
 
-func (m *fullTransferPhase) createFolderFullTransferHandlerFunc(node *reposnapshot.Node, pcWrapper *producerConsumerWrapper, uploadChunkChan chan UploadedChunk,
+func (m *fullTransferPhase) createFolderFullTransferHandlerFunc(node *reposnapshot.Node, pcWrapper *producerConsumerWrapper,
 	delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng) folderFullTransferHandlerFunc {
 	return func(params folderParams) parallel.TaskFunc {
 		return func(threadId int) error {
 			logMsgPrefix := clientUtils.GetLogMsgPrefix(threadId, false)
-			return m.transferFolder(node, params, logMsgPrefix, pcWrapper, uploadChunkChan, delayHelper, errorsChannelMng)
+			return m.transferFolder(node, params, logMsgPrefix, pcWrapper, delayHelper, errorsChannelMng)
 		}
 	}
 }
 
 func (m *fullTransferPhase) transferFolder(node *reposnapshot.Node, params folderParams, logMsgPrefix string, pcWrapper *producerConsumerWrapper,
-	uploadChunkChan chan UploadedChunk, delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng) (err error) {
+	delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng) (err error) {
 	log.Debug(logMsgPrefix+"Handling folder:", path.Join(m.repoKey, params.relativePath))
 
 	// Increment progress number of folders
@@ -232,8 +232,7 @@ func (m *fullTransferPhase) transferFolder(node *reposnapshot.Node, params folde
 		return
 	}
 
-	curUploadChunk, err := m.searchAndHandleFolderContents(params, pcWrapper,
-		uploadChunkChan, delayHelper, errorsChannelMng, node)
+	err = m.searchAndHandleFolderContents(params, pcWrapper, delayHelper, errorsChannelMng, node)
 	if err != nil {
 		return
 	}
@@ -243,28 +242,13 @@ func (m *fullTransferPhase) transferFolder(node *reposnapshot.Node, params folde
 		return err
 	}
 
-	// Chunk didn't reach full size. Upload the remaining files.
-	if len(curUploadChunk.UploadCandidates) > 0 {
-		if _, err = pcWrapper.chunkUploaderProducerConsumer.AddTaskWithError(uploadChunkWhenPossibleHandler(pcWrapper, &m.phaseBase, curUploadChunk, uploadChunkChan, errorsChannelMng), pcWrapper.errorsQueue.AddError); err != nil {
-			return
-		}
-	}
 	log.Debug(logMsgPrefix+"Done transferring folder:", path.Join(m.repoKey, params.relativePath))
 	return
 }
 
 func (m *fullTransferPhase) searchAndHandleFolderContents(params folderParams, pcWrapper *producerConsumerWrapper,
-	uploadChunkChan chan UploadedChunk, delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng,
-	node *reposnapshot.Node) (curUploadChunk api.UploadChunk, err error) {
-	curUploadChunk = api.UploadChunk{
-		TargetAuth:                createTargetAuth(m.targetRtDetails, m.proxyKey),
-		CheckExistenceInFilestore: m.checkExistenceInFilestore,
-		// Skip file filtering in the Data Transfer plugin if it is already enabled in the JFrog CLI.
-		// The local generated filter is enabled in the JFrog CLI for target Artifactory servers >= 7.55.
-		SkipFileFiltering:     m.locallyGeneratedFilter.IsEnabled(),
-		MinCheckSumDeploySize: m.minCheckSumDeploySize,
-	}
-
+	delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng,
+	node *reposnapshot.Node) (err error) {
 	var result []servicesUtils.ResultItem
 	var lastPage bool
 	paginationI := 0
@@ -274,9 +258,14 @@ func (m *fullTransferPhase) searchAndHandleFolderContents(params folderParams, p
 			return
 		}
 
-		// Add the folder as a candidate to transfer. The reason is that we'd like to transfer only folders with properties or empty folders.
-		if params.relativePath != "." {
-			curUploadChunk.AppendUploadCandidateIfNeeded(api.FileRepresentation{Repo: m.repoKey, Path: params.relativePath, NonEmptyDir: len(result) > 0}, m.buildInfoRepo)
+		// Transfer folders with properties or empty folders once per directory scan.
+		if params.relativePath != "." && paginationI == 0 {
+			folder := api.FileRepresentation{Repo: m.repoKey, Path: params.relativePath, NonEmptyDir: len(result) > 0}
+			var shouldStop bool
+			shouldStop, err = m.transferFolderCandidateIfNeeded(folder, delayHelper, errorsChannelMng, pcWrapper)
+			if err != nil || shouldStop {
+				return err
+			}
 		}
 
 		// Empty folder
@@ -293,12 +282,9 @@ func (m *fullTransferPhase) searchAndHandleFolderContents(params folderParams, p
 			}
 			switch item.Type {
 			case "folder":
-				err = m.handleFoundChildFolder(params, pcWrapper,
-					uploadChunkChan, delayHelper, errorsChannelMng, item)
+				err = m.handleFoundChildFolder(params, pcWrapper, delayHelper, errorsChannelMng, item)
 			case "file":
-				err = m.handleFoundFile(pcWrapper,
-					uploadChunkChan, delayHelper, errorsChannelMng,
-					node, item, &curUploadChunk)
+				err = m.handleFoundFile(pcWrapper, delayHelper, errorsChannelMng, node, item)
 			}
 			if err != nil {
 				return
@@ -310,8 +296,17 @@ func (m *fullTransferPhase) searchAndHandleFolderContents(params folderParams, p
 	return
 }
 
+func (m *fullTransferPhase) transferFolderCandidateIfNeeded(folder api.FileRepresentation, delayHelper delayUploadHelper,
+	errorsChannelMng *ErrorsChannelMng, pcWrapper *producerConsumerWrapper) (shouldStop bool, err error) {
+	if m.buildInfoRepo && folder.Name == "" {
+		log.Debug(fmt.Sprintf("Skipping unneeded empty dir '%s' in the build-info repository '%s'", folder.Path, folder.Repo))
+		return false, nil
+	}
+	return transferFiles([]api.FileRepresentation{folder}, m.phaseBase, delayHelper, errorsChannelMng, pcWrapper)
+}
+
 func (m *fullTransferPhase) handleFoundChildFolder(params folderParams, pcWrapper *producerConsumerWrapper,
-	uploadChunkChan chan UploadedChunk, delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng,
+	delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng,
 	item servicesUtils.ResultItem) (err error) {
 	newRelativePath := getFolderRelativePath(item.Name, params.relativePath)
 
@@ -321,7 +316,7 @@ func (m *fullTransferPhase) handleFoundChildFolder(params folderParams, pcWrappe
 		return err
 	}
 
-	folderHandler := m.createFolderFullTransferHandlerFunc(node, pcWrapper, uploadChunkChan, delayHelper, errorsChannelMng)
+	folderHandler := m.createFolderFullTransferHandlerFunc(node, pcWrapper, delayHelper, errorsChannelMng)
 	_, err = pcWrapper.chunkBuilderProducerConsumer.AddTaskWithError(folderHandler(folderParams{relativePath: newRelativePath}), pcWrapper.errorsQueue.AddError)
 	return
 }
@@ -329,8 +324,8 @@ func (m *fullTransferPhase) handleFoundChildFolder(params folderParams, pcWrappe
 // Note: Pattern filtering is handled at AQL level when --include-files is provided.
 // This function is only called during folder traversal (when no patterns are specified).
 func (m *fullTransferPhase) handleFoundFile(pcWrapper *producerConsumerWrapper,
-	uploadChunkChan chan UploadedChunk, delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng,
-	node *reposnapshot.Node, item servicesUtils.ResultItem, curUploadChunk *api.UploadChunk) (err error) {
+	delayHelper delayUploadHelper, errorsChannelMng *ErrorsChannelMng,
+	node *reposnapshot.Node, item servicesUtils.ResultItem) (err error) {
 	file := api.FileRepresentation{Repo: item.Repo, Path: item.Path, Name: item.Name, Size: item.Size}
 	delayed, stopped := delayHelper.delayUploadIfNecessary(m.phaseBase, file)
 	if delayed || stopped {
@@ -346,15 +341,7 @@ func (m *fullTransferPhase) handleFoundFile(pcWrapper *producerConsumerWrapper,
 	if err != nil {
 		return
 	}
-	curUploadChunk.AppendUploadCandidateIfNeeded(file, m.buildInfoRepo)
-	if curUploadChunk.IsChunkFull() {
-		_, err = pcWrapper.chunkUploaderProducerConsumer.AddTaskWithError(uploadChunkWhenPossibleHandler(pcWrapper, &m.phaseBase, *curUploadChunk, uploadChunkChan, errorsChannelMng), pcWrapper.errorsQueue.AddError)
-		if err != nil {
-			return
-		}
-		// Empty the uploaded chunk.
-		curUploadChunk.UploadCandidates = []api.FileRepresentation{}
-	}
+	_, err = pcWrapper.chunkUploaderProducerConsumer.AddTaskWithError(transferFileHandler(&m.phaseBase, file, errorsChannelMng), pcWrapper.errorsQueue.AddError)
 	return
 }
 
@@ -373,7 +360,7 @@ func (m *fullTransferPhase) getDirectoryContentAql(relativePath string, paginati
 	}
 
 	lastPage = len(aqlResults.Results) < AqlPaginationLimit
-	result, err = m.locallyGeneratedFilter.FilterLocallyGenerated(aqlResults.Results)
+	result, err = m.locallyGeneratedFilter.FilterLocallyGenerated(aqlResults.Results, m.packageType)
 	return
 }
 
