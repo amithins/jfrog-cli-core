@@ -89,6 +89,9 @@ func addOverallStatus(stateManager *state.TransferStateManager, output *strings.
 		failureTxt += " (" + progressbar.RetryFailureContentNote + ")"
 	}
 	addString(output, "❌", "Transfer failures", failureTxt, 2)
+	if stateManager.SkippedSourceGone > 0 {
+		addString(output, "⏭ ", "Skipped (deleted at source)", strconv.FormatUint(stateManager.SkippedSourceGone, 10)+" (items that no longer exist in the source; listed in the errors summary CSV, not retried)", 1)
+	}
 	return nil
 }
 

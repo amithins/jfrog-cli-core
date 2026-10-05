@@ -224,6 +224,27 @@ func TestFileTransfer_source404_isSkippedWithZeroSize(t *testing.T) {
 	assert.Zero(t, source.getReaderCalls)
 }
 
+// TestFileTransfer_sourceItemGone_isCountedForSummary verifies that every gone-skip is counted so
+// the end-of-run log line can report how many items were skipped as deleted.
+func TestFileTransfer_sourceItemGone_isCountedForSummary(t *testing.T) {
+	takeSourceItemGoneSkipCount() // reset
+	ft := NewFileTransfer(&mockTransferSource{metadataErr: ErrSourceItemGone}, &mockTransferTarget{}, FileTransferOptions{TargetDeployOptions: defaultTargetDeployOptions()})
+	_ = ft.TransferFile(context.Background(), testFileCandidate())
+
+	ft = NewFileTransfer(&mockTransferSource{metadata: testFileMetadata(), readerErr: ErrSourceItemGone}, &mockTransferTarget{checksumOutcome: ChecksumDeployMiss}, FileTransferOptions{TargetDeployOptions: defaultTargetDeployOptions()})
+	_ = ft.TransferFile(context.Background(), testFileCandidate())
+
+	assert.Equal(t, int64(2), takeSourceItemGoneSkipCount())
+	assert.Zero(t, takeSourceItemGoneSkipCount(), "taking the count resets it")
+}
+
+func TestTransferResult_ToFileUploadStatus_sourceItemGoneHasReason(t *testing.T) {
+	result := TransferResult{Candidate: testFileCandidate(), Status: api.SkippedSourceItemGone, SourceItemGone: true}
+	status := result.ToFileUploadStatus()
+	assert.Equal(t, api.SkippedSourceItemGone, status.Status)
+	assert.Equal(t, ErrSourceItemGone.Error(), status.Reason)
+}
+
 func TestFileTransfer_contentGet404_isSkippedWithZeroSize(t *testing.T) {
 	source := &mockTransferSource{
 		metadata:  testFileMetadata(),

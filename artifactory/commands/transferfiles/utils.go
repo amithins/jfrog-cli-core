@@ -172,7 +172,9 @@ func handleTransferFileResult(phaseBase *phaseBase, result TransferResult, error
 	if statusMovesNoBytes(result.Status) {
 		fileStatus.SizeBytes = 0
 	}
-	if result.Status == api.Fail || result.Status == api.SkippedLargeProps {
+	// Gone-skips are reported like other skips so they appear in the errors CSV for audit; they
+	// are not retryable errors and do not count as failures.
+	if result.Status == api.Fail || result.Status == api.SkippedLargeProps || result.Status == api.SkippedSourceItemGone {
 		if addErrorToChannel(errorsChannelMng, fileStatus) {
 			return errorutils.CheckErrorf("stopped")
 		}

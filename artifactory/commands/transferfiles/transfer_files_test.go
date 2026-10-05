@@ -122,8 +122,9 @@ func TestHandleTransferFileResult_noByteSkipDoesNotUpdateTransferredBytesOrSpeed
 		wantTransferredUnits int64
 	}{
 		// Named skips still count as a completed unit (matching the chunk-status polling path),
-		// so that --status can reach 100% even when metadata files or gone source items are skipped.
-		{name: "source item gone", status: api.SkippedSourceItemGone, fileSize: 0, candidateName: "gone.jar", wantTransferredUnits: 1},
+		// so that --status can reach 100% even when metadata files are skipped. Gone source items are not
+		// transferred and are counted separately (SkippedSourceGone) instead of as transferred units.
+		{name: "source item gone", status: api.SkippedSourceItemGone, fileSize: 0, candidateName: "gone.jar", wantTransferredUnits: 0},
 		{name: "metadata file", status: api.SkippedMetadataFile, fileSize: candidateSize, candidateName: "metadata.xml", wantTransferredUnits: 1},
 		// Directories carry no name, so they're excluded from the unit count, just like UpdateChunkInState does elsewhere.
 		{name: "non-empty directory", status: api.SkippedNonEmptyDir, fileSize: candidateSize, candidateName: "", wantTransferredUnits: 0},
@@ -226,6 +227,42 @@ func TestHandleTransferFileResult_failureReportsToErrorsChannel(t *testing.T) {
 	assert.Equal(t, "fail.jar", collected[0].Name)
 	assert.Equal(t, "transfer failed", collected[0].Reason)
 	assert.Zero(t, stateManager.CurrentRepo.Phase1Info.TransferredSizeBytes)
+}
+
+// TestHandleTransferFileResult_sourceItemGone_reportedToSkippedErrors verifies that a gone-skip is
+// forwarded to the errors channel (so it reaches the errors CSV as a skipped entry) and is NOT
+// counted as a transferred unit (M2); it is counted separately as skipped-because-gone.
+func TestHandleTransferFileResult_sourceItemGone_reportedToSkippedErrors(t *testing.T) {
+	stateManager, cleanUp := state.InitStateTest(t)
+	defer cleanUp()
+
+	assert.NoError(t, stateManager.SetRepoState("test-repo", 0, 1, false, true))
+	assert.NoError(t, stateManager.SetWorkingThreads(1))
+
+	phaseBase := &phaseBase{stateManager: stateManager}
+	result := TransferResult{
+		Candidate:      api.FileRepresentation{Repo: "test-repo", Path: "a", Name: "gone.jar", Size: 1024},
+		Status:         api.SkippedSourceItemGone,
+		SourceItemGone: true,
+		DurationMillis: 10,
+	}
+	errorsChannelMng := createErrorsChannelMng()
+
+	assert.NoError(t, handleTransferFileResult(phaseBase, result, &errorsChannelMng))
+	errorsChannelMng.close()
+
+	var collected []ExtendedFileUploadStatusResponse
+	for e := range errorsChannelMng.channel {
+		collected = append(collected, e)
+	}
+	require.Len(t, collected, 1)
+	assert.Equal(t, api.SkippedSourceItemGone, collected[0].Status)
+	assert.Equal(t, "gone.jar", collected[0].Name)
+	assert.NotEmpty(t, collected[0].Reason, "the CSV row must say why the item was skipped")
+	assert.Zero(t, stateManager.CurrentRepo.Phase1Info.TransferredSizeBytes)
+	assert.Zero(t, stateManager.CurrentRepo.Phase1Info.TransferredUnits, "a gone item was not transferred")
+	assert.Zero(t, stateManager.OverallTransfer.TransferredUnits)
+	assert.Equal(t, uint64(1), stateManager.SkippedSourceGone)
 }
 
 func TestHandleTransferFileResult_skippedLargePropsUpdatesProgressAndErrors(t *testing.T) {
