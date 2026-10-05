@@ -10,6 +10,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
 	coreutils "github.com/jfrog/jfrog-cli-core/v2/artifactory/utils"
@@ -362,7 +363,6 @@ func fileRelativePath(file api.FileRepresentation) string {
 	return path.Join(file.Repo, file.Path, file.Name)
 }
 
-//nolint:unused // consumed by the streaming-download slice stacked on top of this PR
 func closeReadCloser(rc io.ReadCloser) {
 	if rc != nil {
 		_ = rc.Close()
@@ -370,18 +370,26 @@ func closeReadCloser(rc io.ReadCloser) {
 }
 
 type contextReadCloser struct {
-	ctx context.Context
-	rc  io.ReadCloser
+	ctx       context.Context
+	rc        io.ReadCloser
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (c *contextReadCloser) Read(p []byte) (int, error) {
 	if err := c.ctx.Err(); err != nil {
-		_ = c.rc.Close()
+		_ = c.Close()
 		return 0, err
 	}
 	return c.rc.Read(p)
 }
 
+// Close is idempotent: Read may already have closed rc on ctx cancellation, and callers
+// close the reader again on their own error paths, which would otherwise double-close a
+// non-idempotent underlying ReadCloser.
 func (c *contextReadCloser) Close() error {
-	return c.rc.Close()
+	c.closeOnce.Do(func() {
+		c.closeErr = c.rc.Close()
+	})
+	return c.closeErr
 }

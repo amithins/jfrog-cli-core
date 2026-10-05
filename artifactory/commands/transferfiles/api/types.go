@@ -15,11 +15,12 @@ const (
 	Done       ProcessStatusType = "DONE"
 	InProgress ProcessStatusType = "IN_PROGRESS"
 
-	Success             ChunkFileStatusType = "SUCCESS"
-	Fail                ChunkFileStatusType = "FAIL"
-	SkippedLargeProps   ChunkFileStatusType = "SKIPPED_LARGE_PROPS"
-	SkippedMetadataFile ChunkFileStatusType = "SKIPPED_METADATA_FILE"
-	SkippedNonEmptyDir  ChunkFileStatusType = "SKIPPED_NON_EMPTY_DIR"
+	Success               ChunkFileStatusType = "SUCCESS"
+	Fail                  ChunkFileStatusType = "FAIL"
+	SkippedLargeProps     ChunkFileStatusType = "SKIPPED_LARGE_PROPS"
+	SkippedMetadataFile   ChunkFileStatusType = "SKIPPED_METADATA_FILE"
+	SkippedNonEmptyDir    ChunkFileStatusType = "SKIPPED_NON_EMPTY_DIR"
+	SkippedSourceItemGone ChunkFileStatusType = "SKIPPED_SOURCE_ITEM_GONE"
 
 	Phase1 int = 0
 	Phase2 int = 1
