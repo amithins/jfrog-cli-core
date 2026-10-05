@@ -276,7 +276,14 @@ func doManagerGet(ctx context.Context, manager artifactory.ArtifactoryServicesMa
 	return resp, body, err
 }
 
+// applyHttpClientDetails mirrors the authentication, User-Agent and close-connection behavior
+// that jfrog-client-go's http/httpclient.HttpClient.doRequest applies via its own
+// setAuthentication/addUserAgentHeader helpers, for the raw *http.Client requests this package
+// sends outside the service manager (so a per-call ctx can actually abort them). Keep both in
+// sync if client-go adds an auth mode or changes those defaults.
 func applyHttpClientDetails(req *http.Request, details httputils.HttpClientDetails) {
+	// Match client-go's doRequest: don't reuse a persistent connection across requests.
+	req.Close = true
 	req.Header.Set("User-Agent", clientutils.GetUserAgent())
 	if details.ApiKey != "" {
 		if details.User != "" {
