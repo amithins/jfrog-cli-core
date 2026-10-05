@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jfrog/jfrog-cli-core/v2/utils/osutils"
@@ -16,12 +17,22 @@ import (
 	"github.com/jfrog/jfrog-client-go/utils/log"
 )
 
+// lockSeq disambiguates lock files created by this process at the exact same nanosecond
+// timestamp - e.g. two goroutines in the same process calling CreateLock concurrently for
+// different, independently-locked resources (such as two servers' token refreshes sharing
+// the same config file lock dir). Without it, such calls would share the same pid and could
+// share the same currentTime, making lock() unable to tell the two lock files apart and
+// believe either one belongs to both callers.
+var lockSeq atomic.Uint64
+
 type Lock struct {
 	// The current time when the lock was created
 	currentTime int64
 	// The full path to the lock file.
 	fileName string
 	pid      int
+	// seq disambiguates locks created by this process at the same currentTime; see lockSeq.
+	seq uint64
 }
 
 type Locks []Lock
@@ -46,11 +57,12 @@ func (lock *Lock) createNewLockFile(lockDirPath string) error {
 		return err
 	}
 	lock.pid = os.Getpid()
+	lock.seq = lockSeq.Add(1)
 	return lock.createFile(lockDirPath)
 }
 
 func (lock *Lock) getLockFilename(folderName string) string {
-	return filepath.Join(folderName, "jfrog-cli.conf.lck."+strconv.Itoa(lock.pid)+"."+strconv.FormatInt(lock.currentTime, 10))
+	return filepath.Join(folderName, "jfrog-cli.conf.lck."+strconv.Itoa(lock.pid)+"."+strconv.FormatInt(lock.currentTime, 10)+"."+strconv.FormatUint(lock.seq, 10))
 }
 
 func (lock *Lock) createFile(folderName string) error {
@@ -85,25 +97,18 @@ func (lock *Lock) lock() error {
 		if err != nil {
 			return err
 		}
-		// If the first timestamp in the sorted locks slice is equal to this timestamp
-		// means that the lock can be acquired
-		if locks[0].currentTime == lock.currentTime {
-			// Edge case, if at the same time (by the nanoseconds) two different process created two files.
-			// We are checking the PID to know which process can run.
-			if locks[0].pid != lock.pid {
-				err := lock.removeOtherLockOrWait(locks[0], &filesList)
-				if err != nil {
-					return err
-				}
-			} else {
-				log.Debug("Lock has been acquired for", lock.fileName)
-				return nil
-			}
-		} else {
-			err := lock.removeOtherLockOrWait(locks[0], &filesList)
-			if err != nil {
-				return err
-			}
+		// locks[0] is the earliest-created lock file currently in the directory. The lock is
+		// acquired only if it is this exact lock - matched on pid, currentTime and seq together,
+		// not pid and currentTime alone. Two goroutines in this same process (same pid) can call
+		// CreateLock at the same nanosecond (same currentTime); seq is what tells such sibling
+		// lock files apart from this one.
+		if locks[0].pid == lock.pid && locks[0].currentTime == lock.currentTime && locks[0].seq == lock.seq {
+			log.Debug("Lock has been acquired for", lock.fileName)
+			return nil
+		}
+		err = lock.removeOtherLockOrWait(locks[0], &filesList)
+		if err != nil {
+			return err
 		}
 		i++
 	}
@@ -169,11 +174,17 @@ func getLocks(filesList []string) (Locks, error) {
 		fileName := filepath.Base(path)
 		splitted := strings.Split(fileName, ".")
 
-		if len(splitted) != 5 {
+		// A lock file written by a pre-upgrade binary has the legacy 5-component format (no
+		// trailing seq segment). It must still parse here - not just fail outright - so
+		// removeOtherLockOrWait can later remove it if its creating process is no longer
+		// running, or wait for it if it is; otherwise CreateLock would be stuck failing on
+		// this lock directory until someone manually deletes the stale file.
+		if len(splitted) != 5 && len(splitted) != 6 {
 			return nil, errorutils.CheckErrorf("Failed while parsing the file name: %s located at: %s. Expecting a different format.", fileName, path)
 		}
-		// Last element is the timestamp.
-		time, err := strconv.ParseInt(splitted[4], 10, 64)
+		// Second-to-last element is the timestamp; the legacy format has no seq segment at all,
+		// the current format's last element is the disambiguating seq.
+		timestamp, err := strconv.ParseInt(splitted[4], 10, 64)
 		if err != nil {
 			return nil, errorutils.CheckError(err)
 		}
@@ -181,9 +192,17 @@ func getLocks(filesList []string) (Locks, error) {
 		if err != nil {
 			return nil, errorutils.CheckError(err)
 		}
+		var seq uint64
+		if len(splitted) == 6 {
+			seq, err = strconv.ParseUint(splitted[5], 10, 64)
+			if err != nil {
+				return nil, errorutils.CheckError(err)
+			}
+		}
 		file := Lock{
-			currentTime: time,
+			currentTime: timestamp,
 			pid:         pid,
+			seq:         seq,
 			fileName:    path,
 		}
 		files = append(files, file)

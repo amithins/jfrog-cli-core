@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -75,6 +76,39 @@ func TestLockBiggerPid(t *testing.T) {
 	assert.NoError(t, secondLock.Unlock())
 
 	// Confirming that no locks are located in the lock directory
+	files, err = fileutils.ListFiles(testLockDirPath, false)
+	assert.NoError(t, err)
+	assert.Empty(t, files)
+}
+
+// A lock file written by a pre-upgrade binary has the legacy 5-component format
+// ("jfrog-cli.conf.lck.<pid>.<time>", no trailing seq segment). getLocks must still parse it -
+// not fail outright - so a stale legacy file from a dead process can be cleaned up by
+// removeOtherLockOrWait the same way a stale current-format file would be, rather than leaving
+// CreateLock permanently failing on this lock directory until someone manually deletes it.
+func TestLockAcceptsLegacyFilenameFormat(t *testing.T) {
+	assert.NotZero(t, testLockDirPath, "An error occurred while initializing testLockDirPath")
+	assert.NoError(t, fileutils.CreateDirIfNotExist(testLockDirPath))
+
+	// Manually author a legacy, pre-upgrade lock file for a dead process - bypassing
+	// createFile/getLockFilename, which always write the current 6-component format.
+	legacyPid := math.MaxInt - 1
+	legacyFileName := filepath.Join(testLockDirPath, fmt.Sprintf("jfrog-cli.conf.lck.%d.%d", legacyPid, time.Now().UnixNano()))
+	legacyFile, err := os.OpenFile(legacyFileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	assert.NoError(t, err)
+	assert.NoError(t, legacyFile.Close())
+
+	// Creating a second, current-format lock object with the real, running PID.
+	secondLock := getLock(os.Getpid(), t)
+
+	files, err := fileutils.ListFiles(testLockDirPath, false)
+	assert.NoError(t, err)
+	assert.Len(t, files, 2)
+
+	// Must not error parsing the legacy filename, and must remove it since legacyPid isn't running.
+	assert.NoError(t, secondLock.lock())
+	assert.NoError(t, secondLock.Unlock())
+
 	files, err = fileutils.ListFiles(testLockDirPath, false)
 	assert.NoError(t, err)
 	assert.Empty(t, files)

@@ -3,10 +3,16 @@ package config
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	configtests "github.com/jfrog/jfrog-cli-core/v2/utils/config/tests"
 	"github.com/jfrog/jfrog-client-go/auth"
+	"github.com/jfrog/jfrog-client-go/utils/io/httputils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -603,4 +609,295 @@ func TestCreateInitialRefreshableTokensIfNeededBranchCoverage(t *testing.T) {
 		// But we verify the function executes without panic
 		assert.NotNil(t, serverDetails)
 	})
+}
+
+// newFakeAccessTokenServer returns a minimal fake Access service that answers the
+// refresh-token endpoint (POST .../access/api/v1/tokens) with a fixed, server-specific
+// access/refresh token pair, so tests can tell which server a request actually reached.
+func newFakeAccessTokenServer(t *testing.T, newAccessToken, newRefreshToken string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/access/api/v1/tokens") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  newAccessToken,
+			"refresh_token": newRefreshToken,
+			"token_type":    "Bearer",
+		}))
+	}))
+}
+
+// countingFakeAccessTokenServer behaves like newFakeAccessTokenServer, but also counts how many
+// refresh requests actually reached the backend, so tests can assert that concurrent refresh
+// attempts for the same server were deduplicated by serverRefreshMutex down to a single
+// backend call.
+func countingFakeAccessTokenServer(t *testing.T, newAccessToken, newRefreshToken string) (*httptest.Server, *atomic.Int32) {
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/access/api/v1/tokens") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		requestCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  newAccessToken,
+			"refresh_token": newRefreshToken,
+			"token_type":    "Bearer",
+		}))
+	}))
+	return server, &requestCount
+}
+
+// TestConcurrentRefreshesForSameServerAreDeduplicated is a regression test for serverRefreshMutex
+// itself. TestTokenRefreshIsScopedPerServer calls tokenRefreshHandler directly for two different
+// servers, which skips tokenRefreshPreRequestInterceptor (and therefore the mutex entirely) and is
+// serialized anyway by the cross-process config file lock - so it proves nothing about per-server
+// deduplication of concurrent refreshes for the SAME server.
+//
+// This test drives two concurrent requests through the real entry point
+// (RunPreRequestFunctions -> tokenRefreshPreRequestInterceptor) on the same server's auth config,
+// exactly as two in-flight HTTP requests on one server would race through the interceptor.
+//
+// Attack scenario this guards against: if serverRefreshMutex regressed to hand back a distinct
+// mutex per call (e.g. LoadOrStore misuse, or a key mismatch between callers), both goroutines
+// would pass the "token not already refreshed" check (fields.AccessToken == httpClientDetails.AccessToken)
+// at the same time and both call tokenRefreshHandler. The second call would present an
+// already-rotated refresh token to the backend, and in a real server that second refresh would
+// fail or clobber the first one's stored tokens. A correctly scoped mutex must ensure only one of
+// the two concurrent calls ever reaches the backend, and both callers must still observe the
+// single resulting token.
+func TestConcurrentRefreshesForSameServerAreDeduplicated(t *testing.T) {
+	cleanUpTempEnv := configtests.CreateTempEnv(t, false)
+	defer cleanUpTempEnv()
+
+	server, refreshRequests := countingFakeAccessTokenServer(t, "new-access-token", "new-refresh-token")
+	defer server.Close()
+
+	// Already expired, so tokenRefreshHandler refreshes immediately instead of sleeping.
+	oldToken := buildTestAccessToken(t, 1, 2)
+	details := &ServerDetails{
+		ServerId:     "server-dedup",
+		Url:          server.URL + "/",
+		AccessToken:  oldToken,
+		RefreshToken: "refresh-token-dedup", // #nosec G101 -- test data only
+	}
+	require.NoError(t, SaveServersConf([]*ServerDetails{details}))
+
+	artAuth, err := details.CreateArtAuthConfig()
+	require.NoError(t, err)
+	require.Len(t, artAuth.GetPreRequestFunctions(), 1)
+
+	const concurrentRequests = 2
+	var wg sync.WaitGroup
+	httpDetailsPerRequest := make([]httputils.HttpClientDetails, concurrentRequests)
+	errsPerRequest := make([]error, concurrentRequests)
+	wg.Add(concurrentRequests)
+	for i := 0; i < concurrentRequests; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			httpDetailsPerRequest[i] = httputils.HttpClientDetails{AccessToken: oldToken}
+			errsPerRequest[i] = artAuth.RunPreRequestFunctions(&httpDetailsPerRequest[i])
+		}()
+	}
+	wg.Wait()
+
+	for i := 0; i < concurrentRequests; i++ {
+		require.NoError(t, errsPerRequest[i])
+		assert.Equal(t, "new-access-token", httpDetailsPerRequest[i].AccessToken,
+			"both concurrent callers must observe the single refreshed token")
+	}
+	assert.Equal(t, int32(1), refreshRequests.Load(),
+		"serverRefreshMutex must deduplicate two concurrent refreshes for the same server into a single backend call")
+}
+
+// TestConcurrentRefreshesForDifferentServersUseIndependentInterceptors complements the test above:
+// it proves that two servers refreshing at the same time, each through its own interceptor
+// (the exact "jf rt transfer-files src tgt" shape the credential-host-binding fix targets), each
+// reach only their own backend and never block on, or get deduplicated against, the other
+// server's mutex.
+func TestConcurrentRefreshesForDifferentServersUseIndependentInterceptors(t *testing.T) {
+	cleanUpTempEnv := configtests.CreateTempEnv(t, false)
+	defer cleanUpTempEnv()
+
+	serverA, requestsA := countingFakeAccessTokenServer(t, "new-access-token-for-A", "new-refresh-token-for-A") // #nosec G101 -- test data only
+	defer serverA.Close()
+	serverB, requestsB := countingFakeAccessTokenServer(t, "new-access-token-for-B", "new-refresh-token-for-B") // #nosec G101 -- test data only
+	defer serverB.Close()
+
+	oldTokenA := buildTestAccessToken(t, 1, 2)
+	oldTokenB := buildTestAccessToken(t, 1, 2)
+
+	detailsA := &ServerDetails{
+		ServerId:     "server-A-independent",
+		Url:          serverA.URL + "/",
+		AccessToken:  oldTokenA,
+		RefreshToken: "refresh-token-A", // #nosec G101 -- test data only
+	}
+	detailsB := &ServerDetails{
+		ServerId:     "server-B-independent",
+		Url:          serverB.URL + "/",
+		AccessToken:  oldTokenB,
+		RefreshToken: "refresh-token-B", // #nosec G101 -- test data only
+	}
+	require.NoError(t, SaveServersConf([]*ServerDetails{detailsA, detailsB}))
+
+	artAuthA, err := detailsA.CreateArtAuthConfig()
+	require.NoError(t, err)
+	artAuthB, err := detailsB.CreateArtAuthConfig()
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	var httpDetailsA, httpDetailsB httputils.HttpClientDetails
+	var errA, errB error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		httpDetailsA = httputils.HttpClientDetails{AccessToken: oldTokenA}
+		errA = artAuthA.RunPreRequestFunctions(&httpDetailsA)
+	}()
+	go func() {
+		defer wg.Done()
+		httpDetailsB = httputils.HttpClientDetails{AccessToken: oldTokenB}
+		errB = artAuthB.RunPreRequestFunctions(&httpDetailsB)
+	}()
+	wg.Wait()
+
+	require.NoError(t, errA)
+	require.NoError(t, errB)
+	assert.Equal(t, "new-access-token-for-A", httpDetailsA.AccessToken)
+	assert.Equal(t, "new-access-token-for-B", httpDetailsB.AccessToken)
+	assert.Equal(t, int32(1), requestsA.Load(), "server A's refresh must reach server A's backend exactly once")
+	assert.Equal(t, int32(1), requestsB.Load(), "server B's refresh must reach server B's backend exactly once")
+}
+
+// TestTokenRefreshIsScopedPerServer is a regression test for the vulnerability where the
+// server used to refresh a token was tracked in a single process-global variable
+// (tokenRefreshServerId) that every createAuthConfig call overwrote. Under that scheme,
+// once two servers were configured in one process (e.g. "jf rt transfer-files src tgt"),
+// a refresh triggered for server A's token could resolve against server B's config entry
+// and credentials, handing server A's host a live access token that actually belongs to
+// server B (CWE-522).
+//
+// Concrete scenario: two servers, A and B, each configured with their own refreshable
+// token and their own fake Access backend. We trigger a refresh for A concurrently with a
+// refresh for B (mirroring a multi-server command, or two refreshes racing each other) and
+// assert that each server's config entry ends up with its own new token - never the
+// other's.
+func TestTokenRefreshIsScopedPerServer(t *testing.T) {
+	cleanUpTempEnv := configtests.CreateTempEnv(t, false)
+	defer cleanUpTempEnv()
+
+	serverA := newFakeAccessTokenServer(t, "new-access-token-for-A", "new-refresh-token-for-A") // #nosec G101 -- test data only
+	defer serverA.Close()
+	serverB := newFakeAccessTokenServer(t, "new-access-token-for-B", "new-refresh-token-for-B") // #nosec G101 -- test data only
+	defer serverB.Close()
+
+	// Both tokens are already expired, so tokenRefreshHandler refreshes immediately
+	// instead of sleeping.
+	oldTokenA := buildTestAccessToken(t, 1, 2)
+	oldTokenB := buildTestAccessToken(t, 1, 2)
+
+	detailsA := &ServerDetails{
+		ServerId:     "server-A",
+		Url:          serverA.URL + "/",
+		AccessToken:  oldTokenA,
+		RefreshToken: "refresh-token-A", // #nosec G101 -- test data only
+	}
+	detailsB := &ServerDetails{
+		ServerId:     "server-B",
+		Url:          serverB.URL + "/",
+		AccessToken:  oldTokenB,
+		RefreshToken: "refresh-token-B", // #nosec G101 -- test data only
+	}
+	require.NoError(t, SaveServersConf([]*ServerDetails{detailsA, detailsB}))
+
+	// Fire both refreshes at the same time: this is exactly the "concurrent operations
+	// across multiple server configs in one process" scenario the vulnerability required.
+	var wg sync.WaitGroup
+	var newTokenA, newTokenB string
+	var errA, errB error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		newTokenA, errA = tokenRefreshHandler("server-A", oldTokenA, AccessToken)
+	}()
+	go func() {
+		defer wg.Done()
+		newTokenB, errB = tokenRefreshHandler("server-B", oldTokenB, AccessToken)
+	}()
+	wg.Wait()
+
+	require.NoError(t, errA)
+	require.NoError(t, errB)
+
+	// Each caller must get back the token issued by its *own* server, never the other's.
+	assert.Equal(t, "new-access-token-for-A", newTokenA)
+	assert.Equal(t, "new-access-token-for-B", newTokenB)
+
+	// And what landed in persistent config for each server must likewise be its own
+	// token - this is the state the old global tokenRefreshServerId could corrupt.
+	confA, err := GetSpecificConfig("server-A", true, false)
+	require.NoError(t, err)
+	confB, err := GetSpecificConfig("server-B", true, false)
+	require.NoError(t, err)
+	assert.Equal(t, "new-access-token-for-A", confA.AccessToken)
+	assert.Equal(t, "new-refresh-token-for-A", confA.RefreshToken)
+	assert.Equal(t, "new-access-token-for-B", confB.AccessToken)
+	assert.Equal(t, "new-refresh-token-for-B", confB.RefreshToken)
+}
+
+// TestAccessTokenRefreshPreRequestInterceptorBoundToOwnServer proves that the interceptor
+// handed to a server's auth config is bound, at creation time, to that server's own
+// ServerId and never drifts when another server's auth config is created afterward in the
+// same process - the exact sequence (createAuthConfig(A) then createAuthConfig(B)) that
+// used to overwrite the shared tokenRefreshServerId global with B's id.
+func TestAccessTokenRefreshPreRequestInterceptorBoundToOwnServer(t *testing.T) {
+	cleanUpTempEnv := configtests.CreateTempEnv(t, false)
+	defer cleanUpTempEnv()
+
+	serverA := newFakeAccessTokenServer(t, "new-access-token-for-A", "new-refresh-token-for-A") // #nosec G101 -- test data only
+	defer serverA.Close()
+	serverB := newFakeAccessTokenServer(t, "new-access-token-for-B", "new-refresh-token-for-B") // #nosec G101 -- test data only
+	defer serverB.Close()
+
+	oldTokenA := buildTestAccessToken(t, 1, 2)
+	oldTokenB := buildTestAccessToken(t, 1, 2)
+
+	detailsA := &ServerDetails{
+		ServerId:     "server-A",
+		Url:          serverA.URL + "/",
+		AccessToken:  oldTokenA,
+		RefreshToken: "refresh-token-A", // #nosec G101 -- test data only
+	}
+	detailsB := &ServerDetails{
+		ServerId:     "server-B",
+		Url:          serverB.URL + "/",
+		AccessToken:  oldTokenB,
+		RefreshToken: "refresh-token-B", // #nosec G101 -- test data only
+	}
+	require.NoError(t, SaveServersConf([]*ServerDetails{detailsA, detailsB}))
+
+	// Create A's auth config first, then B's - mirroring createAuthConfig being called
+	// for two servers in one process (e.g. source/target of a transfer command). With the
+	// old global, this sequence would leave tokenRefreshServerId == "server-B".
+	artAuthA, err := detailsA.CreateArtAuthConfig()
+	require.NoError(t, err)
+	_, err = detailsB.CreateArtAuthConfig()
+	require.NoError(t, err)
+
+	require.Len(t, artAuthA.GetPreRequestFunctions(), 1)
+
+	// Invoke A's interceptor (via RunPreRequestFunctions, the same path a real request
+	// takes) with A's own access token. It must refresh and apply A's own new token (from
+	// serverA), never server-B's, even though B's auth config was created afterward.
+	httpDetails := httputils.HttpClientDetails{AccessToken: oldTokenA}
+	artAuthA.SetAccessToken(oldTokenA)
+	require.NoError(t, artAuthA.RunPreRequestFunctions(&httpDetails))
+	assert.Equal(t, "new-access-token-for-A", httpDetails.AccessToken)
 }

@@ -816,13 +816,14 @@ func (serverDetails *ServerDetails) createAuthConfig(details auth.ServiceDetails
 	// First we check access's token, if empty we check artifactory's token.
 	switch {
 	case serverDetails.RefreshToken != "" && !serverDetails.DisableTokenRefresh:
-		// Save serverId for refreshing if needed. If empty serverId is saved, default will be used.
-		tokenRefreshServerId = serverDetails.ServerId
-		details.AppendPreRequestFunction(AccessTokenRefreshPreRequestInterceptor)
+		// Bind the interceptor to this ServerDetails' own serverId (if empty, default will be
+		// used). Binding per-interceptor - rather than writing to shared/global state - ensures
+		// this interceptor can never refresh or apply tokens belonging to a different server,
+		// even when auth configs for multiple servers are created in the same process.
+		details.AppendPreRequestFunction(AccessTokenRefreshPreRequestInterceptor(serverDetails.ServerId))
 	case serverDetails.ArtifactoryRefreshToken != "":
-		// Save serverId for refreshing if needed. If empty serverId is saved, default will be used.
-		tokenRefreshServerId = serverDetails.ServerId
-		details.AppendPreRequestFunction(ArtifactoryTokenRefreshPreRequestInterceptor)
+		// See comment above: bind to this server's own id, never a shared global.
+		details.AppendPreRequestFunction(ArtifactoryTokenRefreshPreRequestInterceptor(serverDetails.ServerId))
 	default:
 		details.SetUser(serverDetails.User)
 		details.SetPassword(serverDetails.Password)

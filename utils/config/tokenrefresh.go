@@ -20,10 +20,9 @@ import (
 )
 
 // Internal golang locking for the same process.
-var mutex sync.Mutex
-
-// The serverId used for authentication. Use for reading and writing tokens from/to the config file, and for reading the credentials if needed.
-var tokenRefreshServerId string
+// Refreshes are serialized per server-id so that a refresh in flight for one server
+// never blocks (or is confused with) a refresh for a different server.
+var mutexes sync.Map // map[string]*sync.Mutex, keyed by serverId
 
 const (
 	ArtifactoryToken TokenType = "artifactory"
@@ -32,16 +31,49 @@ const (
 
 type TokenType string
 
-func AccessTokenRefreshPreRequestInterceptor(fields *auth.CommonConfigFields, httpClientDetails *httputils.HttpClientDetails) (err error) {
-	return tokenRefreshPreRequestInterceptor(fields, httpClientDetails, AccessToken)
+// serverRefreshMutex returns (creating if necessary) the mutex dedicated to serverId.
+// Using a per-server lock - rather than a single process-wide one - guarantees that
+// refresh work for server A can never be serialized against, or mistaken for, refresh
+// work for server B.
+func serverRefreshMutex(serverId string) *sync.Mutex {
+	m, _ := mutexes.LoadOrStore(serverId, &sync.Mutex{})
+	mutex, ok := m.(*sync.Mutex)
+	if !ok {
+		// mutexes only ever stores *sync.Mutex values (see the LoadOrStore above), so this
+		// can't happen in practice. Fail loudly rather than silently proceeding unlocked.
+		log.Error("serverRefreshMutex: unexpected value type stored in mutexes map")
+		return &sync.Mutex{}
+	}
+	return mutex
 }
 
-func ArtifactoryTokenRefreshPreRequestInterceptor(fields *auth.CommonConfigFields, httpClientDetails *httputils.HttpClientDetails) (err error) {
-	return tokenRefreshPreRequestInterceptor(fields, httpClientDetails, ArtifactoryToken)
+// AccessTokenRefreshPreRequestInterceptor returns a pre-request interceptor bound to serverId.
+// Binding the server identity into the returned closure (instead of relying on shared,
+// package-level state) ensures the interceptor can only ever refresh and apply tokens
+// for the exact server it was created for - never a different, unrelated server
+// configured in the same process.
+func AccessTokenRefreshPreRequestInterceptor(serverId string) auth.ServiceDetailsPreRequestFunc {
+	return func(fields *auth.CommonConfigFields, httpClientDetails *httputils.HttpClientDetails) error {
+		return tokenRefreshPreRequestInterceptor(serverId, fields, httpClientDetails, AccessToken)
+	}
 }
 
-func tokenRefreshPreRequestInterceptor(fields *auth.CommonConfigFields, httpClientDetails *httputils.HttpClientDetails, tokenType TokenType) (err error) {
-	if fields.GetAccessToken() == "" || httpClientDetails.AccessToken == "" {
+// ArtifactoryTokenRefreshPreRequestInterceptor returns a pre-request interceptor bound to serverId.
+// See AccessTokenRefreshPreRequestInterceptor for why serverId must be bound per-interceptor.
+func ArtifactoryTokenRefreshPreRequestInterceptor(serverId string) auth.ServiceDetailsPreRequestFunc {
+	return func(fields *auth.CommonConfigFields, httpClientDetails *httputils.HttpClientDetails) error {
+		return tokenRefreshPreRequestInterceptor(serverId, fields, httpClientDetails, ArtifactoryToken)
+	}
+}
+
+func tokenRefreshPreRequestInterceptor(serverId string, fields *auth.CommonConfigFields, httpClientDetails *httputils.HttpClientDetails, tokenType TokenType) (err error) {
+	// httpClientDetails is this request's own copy, not shared across concurrent requests for
+	// this server, so checking it alone is race-free. It is sufficient too: httpClientDetails.AccessToken
+	// is populated from fields.AccessToken when the request was built, so it is empty exactly when
+	// fields' own token is. Reading fields.AccessToken directly here (outside serverRefreshMutex)
+	// would instead race with the write to it in the locked section below, made by a concurrent
+	// in-flight request against this same server.
+	if httpClientDetails.AccessToken == "" {
 		return nil
 	}
 
@@ -54,12 +86,15 @@ func tokenRefreshPreRequestInterceptor(fields *auth.CommonConfigFields, httpClie
 	if err != nil || timeLeft > refreshBeforeExpiryMinutes {
 		return err
 	}
-	// Lock to make sure only one thread is trying to refresh
+	// Lock on this server's own mutex to make sure only one thread is trying to refresh
+	// this server's token. A concurrent refresh for a different server uses a different
+	// mutex and proceeds independently.
+	mutex := serverRefreshMutex(serverId)
 	mutex.Lock()
 	defer mutex.Unlock()
 	// Refresh only if a new token wasn't acquired (by another thread) while waiting at mutex.
 	if fields.AccessToken == httpClientDetails.AccessToken {
-		newAccessToken, err := tokenRefreshHandler(httpClientDetails.AccessToken, tokenType)
+		newAccessToken, err := tokenRefreshHandler(serverId, httpClientDetails.AccessToken, tokenType)
 		if err != nil {
 			return err
 		}
@@ -83,7 +118,11 @@ func refreshThresholdForTokenType(token string, tokenType TokenType) (int64, err
 	return auth.GetPlatformTokenRefreshThreshold(token)
 }
 
-func tokenRefreshHandler(currentAccessToken string, tokenType TokenType) (newAccessToken string, err error) {
+// tokenRefreshHandler loads, refreshes and persists the refreshable token for serverId only.
+// serverId is an explicit parameter (never a shared/global variable) so that this call can
+// never be redirected, by a concurrent call for a different server, into reading or writing
+// the wrong server's config entry or credentials.
+func tokenRefreshHandler(serverId string, currentAccessToken string, tokenType TokenType) (newAccessToken string, err error) {
 	log.Debug("Refreshing token...")
 	// Lock config to prevent access from different processes
 	lockDirPath, err := coreutils.GetJfrogConfigLockDir()
@@ -99,12 +138,12 @@ func tokenRefreshHandler(currentAccessToken string, tokenType TokenType) (newAcc
 		return
 	}
 
-	serverConfiguration, err := GetSpecificConfig(tokenRefreshServerId, true, false)
+	serverConfiguration, err := GetSpecificConfig(serverId, true, false)
 	if err != nil {
 		return
 	}
-	if tokenRefreshServerId == "" && serverConfiguration != nil {
-		tokenRefreshServerId = serverConfiguration.ServerId
+	if serverId == "" && serverConfiguration != nil {
+		serverId = serverConfiguration.ServerId
 	}
 	// If token already refreshed, get new token from config
 	if serverConfiguration.AccessToken != "" && serverConfiguration.AccessToken != currentAccessToken {
@@ -123,18 +162,18 @@ func tokenRefreshHandler(currentAccessToken string, tokenType TokenType) (newAcc
 	}
 
 	if tokenType == ArtifactoryToken {
-		newAccessToken, err = refreshArtifactoryTokenAndWriteToConfig(serverConfiguration, currentAccessToken)
+		newAccessToken, err = refreshArtifactoryTokenAndWriteToConfig(serverId, serverConfiguration, currentAccessToken)
 		return
 	}
 	if tokenType == AccessToken {
-		newAccessToken, err = refreshAccessTokenAndWriteToConfig(serverConfiguration, currentAccessToken)
+		newAccessToken, err = refreshAccessTokenAndWriteToConfig(serverId, serverConfiguration, currentAccessToken)
 		return
 	}
 	err = errorutils.CheckErrorf("unsupported refreshable token type: %s", string(tokenType))
 	return
 }
 
-func refreshArtifactoryTokenAndWriteToConfig(serverConfiguration *ServerDetails, currentAccessToken string) (string, error) {
+func refreshArtifactoryTokenAndWriteToConfig(serverId string, serverConfiguration *ServerDetails, currentAccessToken string) (string, error) {
 	refreshToken := serverConfiguration.ArtifactoryRefreshToken
 	// Remove previous tokens
 	serverConfiguration.AccessToken = ""
@@ -160,17 +199,17 @@ func refreshArtifactoryTokenAndWriteToConfig(serverConfiguration *ServerDetails,
 		log.Debug("Token refreshed successfully.")
 	}
 
-	err = writeNewTokens(serverConfiguration, tokenRefreshServerId, newToken.AccessToken, newToken.RefreshToken, ArtifactoryToken)
+	err = writeNewTokens(serverConfiguration, serverId, newToken.AccessToken, newToken.RefreshToken, ArtifactoryToken)
 	return newToken.AccessToken, err
 }
 
-func refreshAccessTokenAndWriteToConfig(serverConfiguration *ServerDetails, currentAccessToken string) (string, error) {
+func refreshAccessTokenAndWriteToConfig(serverId string, serverConfiguration *ServerDetails, currentAccessToken string) (string, error) {
 	// Try refreshing tokens
 	newToken, err := refreshExpiredAccessToken(serverConfiguration, currentAccessToken, serverConfiguration.RefreshToken)
 	if err != nil {
 		return "", errorutils.CheckErrorf("Refresh access token failed: %s", err.Error())
 	}
-	err = writeNewTokens(serverConfiguration, tokenRefreshServerId, newToken.AccessToken, newToken.RefreshToken, AccessToken)
+	err = writeNewTokens(serverConfiguration, serverId, newToken.AccessToken, newToken.RefreshToken, AccessToken)
 	return newToken.AccessToken, err
 }
 
@@ -222,6 +261,7 @@ func CreateInitialRefreshableTokensIfNeeded(serverDetails *ServerDetails) (err e
 	if serverDetails.ArtifactoryTokenRefreshInterval <= 0 || serverDetails.ArtifactoryRefreshToken != "" || serverDetails.AccessToken != "" {
 		return nil
 	}
+	mutex := serverRefreshMutex(serverDetails.ServerId)
 	mutex.Lock()
 	defer mutex.Unlock()
 	lockDirPath, err := coreutils.GetJfrogConfigLockDir()
