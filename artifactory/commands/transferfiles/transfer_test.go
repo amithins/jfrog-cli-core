@@ -79,6 +79,21 @@ func TestRunSetup_usesTargetPing_notPluginExecute(t *testing.T) {
 	assert.Equal(t, int32(0), pluginExecuteCalls.Load(), "command setup must not call /api/plugins/execute")
 }
 
+func TestRun_schemeLessProxyKeyWithoutSourceFailsClosed(t *testing.T) {
+	cmd, err := NewTransferFilesCommand(nil, nil)
+	require.NoError(t, err)
+	cmd.SetProxyKey("source-to-target")
+
+	err = cmd.Run()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"source-to-target"`)
+	assert.Contains(t, err.Error(), "looked up on the source Artifactory")
+	assert.Contains(t, err.Error(), "source Artifactory is not configured")
+	assert.Contains(t, err.Error(), "http://proxy:3128")
+	assert.Contains(t, err.Error(), "HTTPS_PROXY")
+	assert.Contains(t, err.Error(), "NO_PROXY")
+}
+
 func TestHandleStopInitAndClose(t *testing.T) {
 	transferFilesCommand, err := NewTransferFilesCommand(nil, nil)
 	assert.NoError(t, err)
@@ -242,7 +257,7 @@ func TestGetAllLocalRepositories(t *testing.T) {
 	assert.NoError(t, err)
 	storageInfoManager, err := coreUtils.NewStorageInfoManager(context.Background(), serverDetails)
 	assert.NoError(t, err)
-	localRepos, localBuildInfoRepo, err := transferFilesCommand.getAllLocalRepos(serverDetails, storageInfoManager)
+	localRepos, localBuildInfoRepo, err := transferFilesCommand.getAllLocalRepos(serverDetails, storageInfoManager, false)
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, []string{"repo-1", "repo-2", "federated-repo-1", "federated-repo-2"}, localRepos)
 	assert.ElementsMatch(t, []string{"artifactory-build-info", "proj-build-info"}, localBuildInfoRepo)
