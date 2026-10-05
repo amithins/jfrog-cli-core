@@ -23,7 +23,6 @@ type transferPhase interface {
 	setRepoKey(repoKey string)
 	setCheckExistenceInFilestore(bool)
 	shouldSkipPhase() (bool, error)
-	setSrcUserPluginService(*srcUserPluginService)
 	setSourceDetails(*coreConfig.ServerDetails)
 	getSourceDetails() *coreConfig.ServerDetails
 	setTargetDetails(*coreConfig.ServerDetails)
@@ -33,7 +32,6 @@ type transferPhase interface {
 	setStateManager(stateManager *state.TransferStateManager)
 	setLocallyGeneratedFilter(locallyGeneratedFilter *locallyGeneratedFilter)
 	initProgressBar() error
-	setProxyKey(proxyKey string)
 	setBuildInfo(setBuildInfo bool)
 	setPackageType(packageType string)
 	setDisabledDistinctiveAql()
@@ -58,12 +56,10 @@ type phaseBase struct {
 	phaseId                   int
 	checkExistenceInFilestore bool
 	startTime                 time.Time
-	srcUpService              *srcUserPluginService
 	srcRtDetails              *coreConfig.ServerDetails
 	targetRtDetails           *coreConfig.ServerDetails
 	progressBar               *TransferProgressMng
 	repoSummary               serviceUtils.RepositorySummary
-	proxyKey                  string
 	pcDetails                 *producerConsumerWrapper
 	transferManager           *transferManager
 	stateManager              *state.TransferStateManager
@@ -119,10 +115,6 @@ func (pb *phaseBase) setCheckExistenceInFilestore(shouldCheck bool) {
 	pb.checkExistenceInFilestore = shouldCheck
 }
 
-func (pb *phaseBase) setSrcUserPluginService(service *srcUserPluginService) {
-	pb.srcUpService = service
-}
-
 func (pb *phaseBase) setSourceDetails(details *coreConfig.ServerDetails) {
 	pb.srcRtDetails = details
 }
@@ -137,10 +129,6 @@ func (pb *phaseBase) setRepoSummary(repoSummary serviceUtils.RepositorySummary) 
 
 func (pb *phaseBase) setProgressBar(progressbar *TransferProgressMng) {
 	pb.progressBar = progressbar
-}
-
-func (pb *phaseBase) setProxyKey(proxyKey string) {
-	pb.proxyKey = proxyKey
 }
 
 func (pb *phaseBase) setStateManager(stateManager *state.TransferStateManager) {

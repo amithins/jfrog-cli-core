@@ -43,7 +43,9 @@ type TransferRunStatus struct {
 	DelayedFiles          uint64 `json:"delayed_files,omitempty"`
 	TransferFailures      uint64 `json:"transfer_failures,omitempty"`
 	TimeEstimationManager `json:"time_estimation,omitempty"`
-	StaleChunks           []StaleChunks `json:"stale_chunks,omitempty"`
+	// StaleChunks is retained for on-disk run-status.json schema compatibility.
+	// GET/PUT transfer no longer tracks stale plugin chunks.
+	StaleChunks []StaleChunks `json:"stale_chunks,omitempty"`
 }
 
 // This structure contains a collection of chunks that have been undergoing processing for over 30 minutes
