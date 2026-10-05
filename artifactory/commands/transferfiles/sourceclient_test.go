@@ -675,8 +675,6 @@ func TestGetFileMetadata_sizeParseError_fallbackUsed(t *testing.T) {
 	assert.Equal(t, int64(11), metadata.Size)
 }
 
-// TestGetFileMetadata_folderHasNoSizeField verifies that folder-info responses, which carry
-// no "size" field at all, resolve to Size 0 instead of failing to parse.
 func TestGetFileMetadata_folderHasNoSizeField(t *testing.T) {
 	storagePath := "/api/storage/" + testSourceRelativePath()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

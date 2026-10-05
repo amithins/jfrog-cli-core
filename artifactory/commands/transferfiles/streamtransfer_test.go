@@ -212,6 +212,21 @@ func TestStreamGetToPut_putPanic_closesSourceAndUnblocksCopy(t *testing.T) {
 	}
 }
 
+func TestStreamGetToPut_largeGeneratedStream_remainsBufferBounded(t *testing.T) {
+	const streamSize = int64(64 * 1024 * 1024)
+	source := &generatedReadCloser{remaining: streamSize}
+
+	n, err := StreamGetToPut(context.Background(), streamSize, source, func(_ context.Context, reader io.Reader) error {
+		_, copyErr := io.CopyBuffer(io.Discard, reader, make([]byte, defaultStreamBufferSize))
+		return copyErr
+	}, defaultStreamBufferSize)
+
+	require.NoError(t, err)
+	assert.Equal(t, streamSize, n)
+	assert.LessOrEqual(t, source.maxReadRequest, defaultStreamBufferSize)
+	assert.True(t, source.closed.Load())
+}
+
 func TestStreamGetToPut_retryIssuesFreshReader(t *testing.T) {
 	var getCount atomic.Int32
 	payload := strings.Repeat("retry-me", defaultStreamBufferSize)
@@ -249,6 +264,35 @@ func TestStreamGetToPut_retryIssuesFreshReader(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), getCount.Load())
 	assert.Equal(t, payload, committed)
+}
+
+type generatedReadCloser struct {
+	remaining      int64
+	maxReadRequest int
+	closed         atomic.Bool
+}
+
+func (r *generatedReadCloser) Read(p []byte) (int, error) {
+	if len(p) > r.maxReadRequest {
+		r.maxReadRequest = len(p)
+	}
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if int64(n) > r.remaining {
+		n = int(r.remaining)
+	}
+	for i := 0; i < n; i++ {
+		p[i] = 'x'
+	}
+	r.remaining -= int64(n)
+	return n, nil
+}
+
+func (r *generatedReadCloser) Close() error {
+	r.closed.Store(true)
+	return nil
 }
 
 type closeTrackingReadCloser struct {
