@@ -85,21 +85,26 @@ func WinToUnixPathSeparator(filePath string) string {
 // BackupFile creates a backup of the file in filePath. The backup will be found at backupPath.
 // The returned restore function can be called to restore the file's state - the file in filePath will be replaced by the backup in backupPath.
 // If there is no file at filePath, a backup file won't be created, and the restore function will delete the file at filePath.
+// The backup file is always created exclusively. If a symlink or any other non-regular entry already exists at the backup path
+// (for example, one committed to an untrusted repository), an error is returned and nothing is written through it.
+// A stale regular backup file (e.g. left over from a previous run that was interrupted) is removed and recreated.
+// The returned restore function is never nil. If an error is returned, it is a no-op.
 func BackupFile(filePath, backupFileName string) (restore func() error, err error) {
+	restore = func() error { return nil }
 	fileInfo, err := os.Stat(filePath)
 	if errorutils.CheckError(err) != nil {
 		if os.IsNotExist(err) {
-			restore = createRestoreFileFunc(filePath, backupFileName)
+			restore = createRestoreFileFunc(filePath, backupFileName, false)
 			err = nil
 		}
 		return
 	}
 
-	if err = cloneFile(filePath, backupFileName, fileInfo.Mode()); err != nil {
+	if err = cloneFile(filePath, backupFileName, fileInfo.Mode().Perm()); err != nil {
 		return
 	}
 	log.Debug("The file", filePath, "was backed up successfully to", backupFileName)
-	restore = createRestoreFileFunc(filePath, backupFileName)
+	restore = createRestoreFileFunc(filePath, backupFileName, true)
 	return
 }
 
@@ -112,7 +117,12 @@ func cloneFile(origFile, newName string, fileMode os.FileMode) (err error) {
 		err = errors.Join(err, from.Close())
 	}()
 
-	to, err := os.OpenFile(filepath.Join(filepath.Dir(origFile), newName), os.O_RDWR|os.O_CREATE, fileMode)
+	newPath := filepath.Join(filepath.Dir(origFile), newName)
+	if err = removeStaleRegularFile(newPath); err != nil {
+		return
+	}
+	// O_EXCL guarantees that a new file is created. The call fails if any entry (including a symlink, even a dangling one) exists at newPath.
+	to, err := os.OpenFile(newPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fileMode)
 	if errorutils.CheckError(err) != nil {
 		return
 	}
@@ -126,30 +136,64 @@ func cloneFile(origFile, newName string, fileMode os.FileMode) (err error) {
 	return
 }
 
+// removeStaleRegularFile prepares path to be created exclusively.
+// If nothing exists at path, it does nothing. If a regular file exists at path (e.g. a leftover backup from a previous run), it is removed.
+// If a symlink or any other non-regular entry exists at path, an error is returned, without following or modifying it.
+func removeStaleRegularFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return errorutils.CheckError(err)
+	}
+	if !info.Mode().IsRegular() {
+		return errorutils.CheckErrorf("refusing to use '%s' as a backup file: a non-regular file (%s) already exists at this path. Remove it and try again", path, describeFileType(info.Mode()))
+	}
+	log.Debug("Removing a stale backup file found at", path)
+	return errorutils.CheckError(os.Remove(path))
+}
+
+func describeFileType(mode os.FileMode) string {
+	switch {
+	case mode&os.ModeSymlink != 0:
+		return "symlink"
+	case mode.IsDir():
+		return "directory"
+	default:
+		return mode.Type().String()
+	}
+}
+
 // createRestoreFileFunc creates a function for restoring a file from its backup.
-// The returned function replaces the file in filePath with the backup in backupPath.
-// If there is no file at backupPath (which means there was no file at filePath when BackupFile() was called), then the function deletes the file at filePath.
-func createRestoreFileFunc(filePath, backupFileName string) func() error {
+// If backupCreated is true, the returned function replaces the file in filePath with the backup in backupPath.
+// Otherwise (there was no file at filePath when BackupFile() was called), the function deletes the file at filePath.
+// The function does not rely on the presence of a file at backupPath to make this decision, so a backup file that was not created by BackupFile() is never restored.
+func createRestoreFileFunc(filePath, backupFileName string, backupCreated bool) func() error {
 	return func() error {
-		backupPath := filepath.Join(filepath.Dir(filePath), backupFileName)
-		if _, err := os.Stat(backupPath); err != nil {
-			if os.IsNotExist(err) {
-				// We verify the existence of the file in the specified filePath before initiating its deletion in order to prevent errors that might occur when attempting to remove a non-existent file
-				var fileExists bool
-				fileExists, err = fileutils.IsFileExists(filePath, false)
-				if err != nil {
-					err = fmt.Errorf("failed to check for the existence of '%s' before deleting the file: %s", filePath, err.Error())
-					return errorutils.CheckError(err)
-				}
-				if fileExists {
-					err = os.Remove(filePath)
-				}
+		if !backupCreated {
+			// We verify the existence of the file in the specified filePath before initiating its deletion in order to prevent errors that might occur when attempting to remove a non-existent file
+			fileExists, err := fileutils.IsFileExists(filePath, false)
+			if err != nil {
+				err = fmt.Errorf("failed to check for the existence of '%s' before deleting the file: %s", filePath, err.Error())
 				return errorutils.CheckError(err)
 			}
-			return errors.New(createRestoreErrorPrefix(filePath, backupPath) + err.Error())
+			if fileExists {
+				err = os.Remove(filePath)
+			}
+			return errorutils.CheckError(err)
 		}
 
-		if err := fileutils.MoveFile(backupPath, filePath); err != nil {
+		backupPath := filepath.Join(filepath.Dir(filePath), backupFileName)
+		backupInfo, err := os.Lstat(backupPath)
+		if err != nil {
+			return errors.New(createRestoreErrorPrefix(filePath, backupPath) + err.Error())
+		}
+		if !backupInfo.Mode().IsRegular() {
+			return errors.New(createRestoreErrorPrefix(filePath, backupPath) + fmt.Sprintf("the backup file was replaced by a non-regular file (%s)", describeFileType(backupInfo.Mode())))
+		}
+
+		if err = fileutils.MoveFile(backupPath, filePath); err != nil {
 			return errorutils.CheckError(err)
 		}
 		log.Debug("Restored the file", filePath, "successfully")
