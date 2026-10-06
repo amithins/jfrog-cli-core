@@ -160,7 +160,7 @@ func TestVerifyConfigImportPluginNotInstalled(t *testing.T) {
 	defer testServer.Close()
 
 	transferConfigCmd := createTransferConfigCommand(t, &config.ServerDetails{Url: "dummy-url"}, serverDetails)
-	err := transferConfigCmd.verifyConfigImportPlugin()
+	err := transferConfigCmd.importer.verify()
 	assert.ErrorContains(t, err, "Response from Artifactory: 404 Not Found.")
 }
 
@@ -174,7 +174,7 @@ func TestVerifyConfigImportPluginForbidden(t *testing.T) {
 	defer testServer.Close()
 
 	transferConfigCmd := createTransferConfigCommand(t, &config.ServerDetails{Url: "dummy-url"}, serverDetails)
-	err := transferConfigCmd.verifyConfigImportPlugin()
+	err := transferConfigCmd.importer.verify()
 	assert.ErrorContains(t, err, "Response from Artifactory: 403 Forbidden.")
 }
 

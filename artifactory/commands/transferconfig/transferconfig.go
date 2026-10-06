@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -45,10 +44,14 @@ type TransferConfigCommand struct {
 	preChecks        bool
 	sourceWorkingDir string
 	targetWorkingDir string
+	importer         configImporter
 }
 
 func NewTransferConfigCommand(sourceServer, targetServer *config.ServerDetails) *TransferConfigCommand {
-	return &TransferConfigCommand{TransferConfigBase: *commandsUtils.NewTransferConfigBase(sourceServer, targetServer)}
+	tcc := &TransferConfigCommand{TransferConfigBase: *commandsUtils.NewTransferConfigBase(sourceServer, targetServer)}
+	// The config-import plugin is currently the only supported way to import the config to the target server
+	tcc.importer = newPluginImporter(tcc)
+	return tcc
 }
 
 func (tcc *TransferConfigCommand) CommandName() string {
@@ -239,12 +242,12 @@ func (tcc *TransferConfigCommand) printWarnings() (err error) {
 	return nil
 }
 
-// Make sure the target Artifactory is empty, by counting the number of the users. If it is bigger than 1, return an error.
-// Also, make sure that the config-import plugin is installed
+// Make sure the target Artifactory is ready for the import, by verifying it with the config importer (for the plugin importer:
+// the config-import plugin is installed and the user is admin).
+// Unless the force flag is set, also make sure the target is empty, by counting the number of the users. If it is bigger than 2, return an error.
 func (tcc *TransferConfigCommand) validateTargetServer() error {
-	// Verify installation of the config-import plugin in the target server and make sure that the user is admin
-	log.Info("Verifying config-import plugin is installed in the target server...")
-	if err := tcc.verifyConfigImportPlugin(); err != nil {
+	// Verify the target server is ready for the import (plugin: the config-import plugin is installed and the user is admin)
+	if err := tcc.importer.verify(); err != nil {
 		return err
 	}
 
@@ -261,37 +264,6 @@ func (tcc *TransferConfigCommand) validateTargetServer() error {
 		return errorutils.CheckErrorf("cowardly refusing to import the config to the target server, because it contains more than 2 users. By default, this command avoids transferring the config to a server which isn't empty. You can bypass this rule by providing the --force flag to the transfer-config command.")
 	}
 	return nil
-}
-
-func (tcc *TransferConfigCommand) verifyConfigImportPlugin() error {
-	artifactoryUrl := clientutils.AddTrailingSlashIfNeeded(tcc.TargetServerDetails.GetArtifactoryUrl())
-
-	// Create rtDetails
-	rtDetails, err := commandsUtils.CreateArtifactoryClientDetails(tcc.TargetArtifactoryManager)
-	if err != nil {
-		return err
-	}
-
-	// Get config-import plugin version
-	configImportVersionUrl := artifactoryUrl + commandsUtils.PluginsExecuteRestApi + "configImportVersion"
-	configImportPluginVersion, err := commandsUtils.GetTransferPluginVersion(tcc.TargetArtifactoryManager.Client(), configImportVersionUrl, "config-import", commandsUtils.Target, rtDetails)
-	if err != nil {
-		return err
-	}
-	log.Info("config-import plugin version: " + configImportPluginVersion)
-
-	// Execute 'GET /api/plugins/execute/checkPermissions'
-	resp, body, _, err := tcc.TargetArtifactoryManager.Client().SendGet(artifactoryUrl+commandsUtils.PluginsExecuteRestApi+"checkPermissions"+tcc.getWorkingDirParam(), false, rtDetails)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode == http.StatusOK {
-		return nil
-	}
-
-	// Unexpected status received: 403 if the user is not admin, 500+ if there is a server error
-	messageFormat := fmt.Sprintf("Target server response: %s.\n%s", resp.Status, body)
-	return errors.New(messageFormat)
 }
 
 // Creates the Pre-checks runner for the config import command
@@ -374,55 +346,23 @@ func (tcc *TransferConfigCommand) exportSourceArtifactory() (string, func() erro
 
 // Import from the input buffer to the target Artifactory
 func (tcc *TransferConfigCommand) importToTargetArtifactory(buffer *bytes.Buffer) (err error) {
-	artifactoryUrl := clientutils.AddTrailingSlashIfNeeded(tcc.TargetServerDetails.GetArtifactoryUrl())
-	var timestamp []byte
-
-	// Create rtDetails
-	rtDetails, err := commandsUtils.CreateArtifactoryClientDetails(tcc.TargetArtifactoryManager)
+	importRef, err := tcc.importer.start(buffer)
 	if err != nil {
 		return err
 	}
 
-	// Sometimes, POST api/plugins/execute/configImport return unexpectedly 404 errors, although the config-import plugin is installed.
-	// To overcome this issue, we use a custom retryExecutor and not the default retry executor that retries only on HTTP errors >= 500.
-	retryExecutor := clientutils.RetryExecutor{
-		MaxRetries:               importStartRetries,
-		RetriesIntervalMilliSecs: importStartRetriesIntervalMilliSecs,
-		ErrorMessage:             fmt.Sprintf("Failed to start the config import process in %s", artifactoryUrl),
-		LogMsgPrefix:             "[Config import]",
-		ExecutionHandler: func() (shouldRetry bool, err error) {
-			// Start the config import async process
-			resp, body, err := tcc.TargetArtifactoryManager.Client().SendPost(artifactoryUrl+commandsUtils.PluginsExecuteRestApi+"configImport"+tcc.getWorkingDirParam(), buffer.Bytes(), rtDetails)
-			if err != nil {
-				return false, err
-			}
-			if err = errorutils.CheckResponseStatusWithBody(resp, body, http.StatusOK); err != nil {
-				return true, err
-			}
-
-			log.Debug("Artifactory response:", resp.Status)
-			timestamp = body
-			log.Info("Config import timestamp: " + string(timestamp))
-			return false, nil
-		},
-	}
-
-	if err = retryExecutor.Execute(); err != nil {
-		return err
-	}
-
 	// Wait for config import completion
-	return tcc.waitForImportCompletion(rtDetails, timestamp)
+	return tcc.waitForImportCompletion(tcc.importer.pollingAction(importRef))
 }
 
-func (tcc *TransferConfigCommand) waitForImportCompletion(rtDetails *httputils.HttpClientDetails, importTimestamp []byte) error {
+func (tcc *TransferConfigCommand) waitForImportCompletion(pollingAction httputils.PollingAction) error {
 	artifactoryUrl := clientutils.AddTrailingSlashIfNeeded(tcc.TargetServerDetails.GetArtifactoryUrl())
 
 	pollingExecutor := &httputils.PollingExecutor{
 		Timeout:         importPollingTimeout,
 		PollingInterval: importPollingInterval,
 		MsgPrefix:       "Waiting for config import completion in Artifactory server at " + artifactoryUrl,
-		PollingAction:   tcc.createImportPollingAction(rtDetails, artifactoryUrl, importTimestamp),
+		PollingAction:   pollingAction,
 	}
 
 	body, err := pollingExecutor.Execute()
@@ -436,52 +376,25 @@ func (tcc *TransferConfigCommand) waitForImportCompletion(rtDetails *httputils.H
 	return nil
 }
 
-func (tcc *TransferConfigCommand) createImportPollingAction(rtDetails *httputils.HttpClientDetails, artifactoryUrl string, importTimestamp []byte) httputils.PollingAction {
-	return func() (shouldStop bool, responseBody []byte, err error) {
-		// Get config import status
-		resp, body, err := tcc.TargetArtifactoryManager.Client().SendPost(artifactoryUrl+commandsUtils.PluginsExecuteRestApi+"configImportStatus"+tcc.getWorkingDirParam(), importTimestamp, rtDetails)
-		if err != nil {
-			return true, nil, err
-		}
+// After the config import, the user used for the target Artifactory server does not exist anymore, because the import replaces
+// all users. Switch the target server details and service managers to use the credentials of the source Artifactory server.
+// Returns the client details of the new target Artifactory service manager.
+func (tcc *TransferConfigCommand) switchTargetToSourceCredentials() (*httputils.HttpClientDetails, error) {
+	newServerDetails := tcc.TargetServerDetails
+	newServerDetails.SetUser(tcc.SourceServerDetails.GetUser())
+	newServerDetails.SetPassword(tcc.SourceServerDetails.GetPassword())
+	newServerDetails.SetAccessToken(tcc.SourceServerDetails.GetAccessToken())
 
-		// 200 - Import completed
-		if resp.StatusCode == http.StatusOK {
-			return true, body, nil
-		}
-
-		// 202 - Import in progress
-		if resp.StatusCode == http.StatusAccepted {
-			return false, nil, nil
-		}
-
-		// Unexpected status
-		if err = errorutils.CheckResponseStatusWithBody(resp, body, http.StatusUnauthorized, http.StatusForbidden); err != nil {
-			return false, nil, err
-		}
-
-		// 401 or 403 - The user used for the target Artifactory server does not exist anymore.
-		// This is perfectly normal, because the import caused the user to be deleted. We can now use the credentials of the source Artifactory server.
-		newServerDetails := tcc.TargetServerDetails
-		newServerDetails.SetUser(tcc.SourceServerDetails.GetUser())
-		newServerDetails.SetPassword(tcc.SourceServerDetails.GetPassword())
-		newServerDetails.SetAccessToken(tcc.SourceServerDetails.GetAccessToken())
-
-		tcc.TargetArtifactoryManager, err = utils.CreateServiceManager(newServerDetails, -1, 0, false)
-		if err != nil {
-			return true, nil, err
-		}
-		tcc.TargetAccessManager, err = utils.CreateAccessServiceManager(newServerDetails, false)
-		if err != nil {
-			return true, nil, err
-		}
-		rtDetails, err = commandsUtils.CreateArtifactoryClientDetails(tcc.TargetArtifactoryManager)
-		if err != nil {
-			return true, nil, err
-		}
-
-		// After 401 or 403, the server credentials are fixed, and therefore we can run again
-		return false, nil, nil
+	var err error
+	tcc.TargetArtifactoryManager, err = utils.CreateServiceManager(newServerDetails, -1, 0, false)
+	if err != nil {
+		return nil, err
 	}
+	tcc.TargetAccessManager, err = utils.CreateAccessServiceManager(newServerDetails, false)
+	if err != nil {
+		return nil, err
+	}
+	return commandsUtils.CreateArtifactoryClientDetails(tcc.TargetArtifactoryManager)
 }
 
 func (tcc *TransferConfigCommand) updateServerDetails() error {
@@ -516,13 +429,6 @@ func (tcc *TransferConfigCommand) updateServerDetails() error {
 	}
 	tcc.TargetServerDetails = newTargetServerDetails
 	return nil
-}
-
-func (tcc *TransferConfigCommand) getWorkingDirParam() string {
-	if tcc.targetWorkingDir != "" {
-		return "?params=workingDir=" + tcc.targetWorkingDir
-	}
-	return ""
 }
 
 // Make sure that the source Artifactory version is sufficient.
