@@ -45,11 +45,12 @@ type TransferConfigCommand struct {
 	sourceWorkingDir string
 	targetWorkingDir string
 	importer         configImporter
+	method           ConfigTransferMethod
 }
 
 func NewTransferConfigCommand(sourceServer, targetServer *config.ServerDetails) *TransferConfigCommand {
-	tcc := &TransferConfigCommand{TransferConfigBase: *commandsUtils.NewTransferConfigBase(sourceServer, targetServer)}
-	// The config-import plugin is currently the only supported way to import the config to the target server
+	tcc := &TransferConfigCommand{TransferConfigBase: *commandsUtils.NewTransferConfigBase(sourceServer, targetServer), method: ConfigTransferMethodAuto}
+	// The importer is chosen by validateMinVersion, once the target Artifactory version is known. The plugin importer is the default.
 	tcc.importer = newPluginImporter(tcc)
 	return tcc
 }
@@ -75,6 +76,12 @@ func (tcc *TransferConfigCommand) SetVerbose(verbose bool) *TransferConfigComman
 
 func (tcc *TransferConfigCommand) SetPreChecks(preChecks bool) *TransferConfigCommand {
 	tcc.preChecks = preChecks
+	return tcc
+}
+
+// SetConfigTransferMethod sets the way the config is imported to the target. The default is ConfigTransferMethodAuto.
+func (tcc *TransferConfigCommand) SetConfigTransferMethod(method ConfigTransferMethod) *TransferConfigCommand {
+	tcc.method = method
 	return tcc
 }
 
@@ -269,12 +276,21 @@ func (tcc *TransferConfigCommand) validateTargetServer() error {
 // Creates the Pre-checks runner for the config import command
 func (tcc *TransferConfigCommand) NewPreChecksRunner(selectedRepos map[utils.RepoType][]services.RepositoryDetails, remoteRepositories []interface{}) (runner *precheckrunner.PreCheckRunner) {
 	runner = precheckrunner.NewPreChecksRunner()
-
-	// Add pre-checks here
-	runner.AddCheck(precheckrunner.NewRepositoryNamingCheck(selectedRepos))
-	runner.AddCheck(precheckrunner.NewRemoteRepositoryCheck(&tcc.TargetArtifactoryManager, remoteRepositories))
-
+	for _, check := range tcc.buildPreChecks(selectedRepos, remoteRepositories) {
+		runner.AddCheck(check)
+	}
 	return
+}
+
+// buildPreChecks returns the pre-checks of the config transfer, in their execution order
+func (tcc *TransferConfigCommand) buildPreChecks(selectedRepos map[utils.RepoType][]services.RepositoryDetails, remoteRepositories []interface{}) []precheckrunner.PreCheck {
+	checks := []precheckrunner.PreCheck{precheckrunner.NewRepositoryNamingCheck(selectedRepos)}
+	if tcc.usesNativeImporter() {
+		// The remote repositories check runs through the config-import plugin, which the native method does not require to be installed
+		log.Warn("The remote repositories URL connectivity pre-check is skipped, since it is not supported by the native config transfer method yet.")
+		return checks
+	}
+	return append(checks, precheckrunner.NewRemoteRepositoryCheck(&tcc.TargetArtifactoryManager, remoteRepositories))
 }
 
 func (tcc *TransferConfigCommand) getEncryptedItems(selectedSourceRepos map[utils.RepoType][]services.RepositoryDetails) (configXml string, remoteRepositories []interface{}, err error) {
@@ -431,7 +447,7 @@ func (tcc *TransferConfigCommand) updateServerDetails() error {
 	return nil
 }
 
-// Make sure that the source Artifactory version is sufficient.
+// Make sure that the source Artifactory version is sufficient, and choose the config importer according to the target Artifactory version.
 // Returns the source Artifactory version.
 func (tcc *TransferConfigCommand) validateMinVersion() (sourceArtifactoryVersion string, err error) {
 	log.Info("Verifying minimum version of the source server...")
@@ -454,8 +470,11 @@ func (tcc *TransferConfigCommand) validateMinVersion() (sourceArtifactoryVersion
 	// Validate that the target Artifactory server version is >= than the source Artifactory server version
 	if !version.NewVersion(targetArtifactoryVersion).AtLeast(sourceArtifactoryVersion) {
 		err = errorutils.CheckErrorf("The source Artifactory version (%s) can't be higher than the target Artifactory version (%s).", sourceArtifactoryVersion, targetArtifactoryVersion)
+		return
 	}
 
+	// Choose the config importer by the target version, which was just fetched. This must be done before validateTargetServer verifies the target.
+	err = tcc.resolveImporter(targetArtifactoryVersion)
 	return
 }
 
