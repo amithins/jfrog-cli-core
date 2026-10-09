@@ -285,10 +285,9 @@ func (tcc *TransferConfigCommand) NewPreChecksRunner(selectedRepos map[utils.Rep
 // buildPreChecks returns the pre-checks of the config transfer, in their execution order
 func (tcc *TransferConfigCommand) buildPreChecks(selectedRepos map[utils.RepoType][]services.RepositoryDetails, remoteRepositories []interface{}) []precheckrunner.PreCheck {
 	checks := []precheckrunner.PreCheck{precheckrunner.NewRepositoryNamingCheck(selectedRepos)}
+	// The remote repositories check runs through the same API as the import: the native config transfer API, or the config-import plugin
 	if tcc.usesNativeImporter() {
-		// The remote repositories check runs through the config-import plugin, which the native method does not require to be installed
-		log.Warn("The remote repositories URL connectivity pre-check is skipped, since it is not supported by the native config transfer method yet.")
-		return checks
+		return append(checks, precheckrunner.NewNativeRemoteRepositoryCheck(&tcc.TargetArtifactoryManager, remoteRepositories))
 	}
 	return append(checks, precheckrunner.NewRemoteRepositoryCheck(&tcc.TargetArtifactoryManager, remoteRepositories))
 }
