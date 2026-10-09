@@ -1,6 +1,7 @@
 package transferconfig
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -328,27 +329,25 @@ func TestBuildPreChecksPerMethod(t *testing.T) {
 		assert.Len(t, names, 2)
 		assert.True(t, remoteRepositoryCheckNames(names), "%v", names)
 	})
-	t.Run("native skips the remote repository check and warns", func(t *testing.T) {
+	t.Run("native runs all the checks, and no warning about a skipped one", func(t *testing.T) {
 		cmd := newCmd(ConfigTransferMethodNative, targetAboveNativeMin)
 		stdout, stderr, previousLog := utilsTests.RedirectLogOutputToBuffer()
 		defer log.SetLogger(previousLog)
 
 		names := checkNames(cmd)
-		assert.Len(t, names, 1, "only the repository naming check is expected: %v", names)
-		assert.False(t, remoteRepositoryCheckNames(names), "%v", names)
-		logged := stdout.String() + stderr.String()
-		assert.Contains(t, logged, "[Warn]")
-		assert.Contains(t, logged, "remote repositories")
+		assert.Len(t, names, 2, "%v", names)
+		assert.True(t, remoteRepositoryCheckNames(names), "%v", names)
+		assert.NotContains(t, stdout.String()+stderr.String(), "[Warn]")
 	})
-	t.Run("auto resolved to native skips the remote repository check", func(t *testing.T) {
+	t.Run("auto resolved to native runs all the checks", func(t *testing.T) {
 		names := checkNames(newCmd(ConfigTransferMethodAuto, targetAboveNativeMin))
-		assert.Len(t, names, 1, "%v", names)
-		assert.False(t, remoteRepositoryCheckNames(names), "%v", names)
+		assert.Len(t, names, 2, "%v", names)
+		assert.True(t, remoteRepositoryCheckNames(names), "%v", names)
 	})
 }
 
-// --prechecks with the native method, against a source that has a remote repository: the remote repositories check would
-// call the plugin, so nothing may reach /api/plugins/execute/* on either server.
+// --prechecks with the native method, against a source that has a remote repository: the remote repositories check runs through
+// the native API of the target, so nothing may reach /api/plugins/execute/* on either server.
 func TestRunPreChecksNativeMakesNoPluginRequests(t *testing.T) {
 	recorder := &requestRecorder{}
 	respond := func(t *testing.T, w http.ResponseWriter, body string) {
@@ -383,6 +382,11 @@ func TestRunPreChecksNativeMakesNoPluginRequests(t *testing.T) {
 			respond(t, w, `{"version":"`+targetAboveNativeMin+`"}`)
 		case "/api/security/users", "/api/repositories":
 			respond(t, w, "[]")
+		case "/api/configTransfer/remoteRepositoriesCheck":
+			w.WriteHeader(http.StatusAccepted)
+			respond(t, w, `{"id":"check-1"}`)
+		case "/api/configTransfer/remoteRepositoriesCheck/check-1":
+			respond(t, w, `{"status":"completed","checked_repositories":1,"total_repositories":1}`)
 		default:
 			assert.Fail(t, "Unexpected target request: "+r.Method+" "+r.RequestURI)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -400,10 +404,48 @@ func TestRunPreChecksNativeMakesNoPluginRequests(t *testing.T) {
 	for _, request := range recorder.all() {
 		assert.NotContains(t, request.uri, commandUtils.PluginsExecuteRestApi, "unexpected plugin request: %s", request)
 	}
-	// The remote repository was in the pre-checks input, so the check was skipped and not just empty
-	var sawRemoteRepo bool
+	// The remote repository was in the pre-checks input, so the native remote repositories check was started and polled on the target
+	var sawRemoteRepo, sawCheckStart, sawCheckPoll bool
 	for _, request := range recorder.all() {
 		sawRemoteRepo = sawRemoteRepo || request.uri == "/api/repositories/remote1"
+		sawCheckStart = sawCheckStart || (request.method == http.MethodPost && request.uri == "/api/configTransfer/remoteRepositoriesCheck")
+		sawCheckPoll = sawCheckPoll || (request.method == http.MethodGet && request.uri == "/api/configTransfer/remoteRepositoriesCheck/check-1")
 	}
 	assert.True(t, sawRemoteRepo, "the source remote repository was expected to be read")
+	assert.True(t, sawCheckStart, "the native remote repositories check was expected to be started on the target")
+	assert.True(t, sawCheckPoll, "the native remote repositories check was expected to be polled on the target")
+}
+
+// The plugin twin of TestRunPreChecksNativeMakesNoPluginRequests: with the plugin method, the remote repositories check runs
+// through the config-import plugin, and nothing may reach /api/configTransfer/*.
+func TestRunPreChecksPluginMakesNoNativeRequests(t *testing.T) {
+	remoteRepositories := []interface{}{map[string]interface{}{"key": "remote1", "url": "https://example.invalid/", "packageType": "generic"}}
+	servers := newVersionServers(t, methodTestSourceVersion, targetAboveNativeMin, func(w http.ResponseWriter, r *http.Request) bool {
+		switch {
+		case r.Method == http.MethodPost && r.RequestURI == "/"+commandUtils.PluginsExecuteRestApi+"remoteRepositoriesCheck":
+			_, err := w.Write([]byte(`{"status":"running","total_repositories":1}`))
+			assert.NoError(t, err)
+		case r.Method == http.MethodGet && r.RequestURI == "/"+commandUtils.PluginsExecuteRestApi+"remoteRepositoriesCheckStatus":
+			_, err := w.Write([]byte(`{"status":"completed","checked_repositories":1,"total_repositories":1}`))
+			assert.NoError(t, err)
+		default:
+			return false
+		}
+		return true
+	})
+	cmd := createTransferConfigCommand(t, servers.sourceDetails, servers.targetDetails).SetConfigTransferMethod(ConfigTransferMethodPlugin)
+	_, err := cmd.validateMinVersion()
+	assert.NoError(t, err)
+	assert.IsType(t, &pluginImporter{}, cmd.importer)
+	_, _, previousLog := utilsTests.RedirectLogOutputToBuffer()
+	defer log.SetLogger(previousLog)
+
+	assert.NoError(t, cmd.NewPreChecksRunner(map[utils.RepoType][]services.RepositoryDetails{}, remoteRepositories).Run(context.Background(), cmd.TargetServerDetails))
+
+	var sawStart bool
+	for _, request := range servers.recorder.all() {
+		assert.NotContains(t, request.uri, "api/configTransfer/", "unexpected native request: %s", request)
+		sawStart = sawStart || (request.method == http.MethodPost && request.uri == "/"+commandUtils.PluginsExecuteRestApi+"remoteRepositoriesCheck")
+	}
+	assert.True(t, sawStart, "the plugin remote repositories check was expected to be started on the target")
 }
