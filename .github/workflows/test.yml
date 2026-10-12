@@ -101,6 +101,12 @@ jobs:
       - name: Setup Go with cache
         uses: JFROG/.github/actions/install-go-with-cache@master
 
+      - name: Setup internal Go modules
+        uses: JFROG/.github/actions/setup-internal-go@f2f48eee963def29140eaffd03b2c6e9c5aeaebf # infra/RTECO-0000-setup-internal-go (JFROG/.github#1, not merged yet)
+        with:
+          app-id: ${{ vars.CROSS_REPO_TOKEN_APP_ID }}
+          private-key: ${{ secrets.CROSS_REPO_TOKEN_PRIVATE_KEY }}
+
       # -race needs cgo, i.e. a C compiler (installed above on GHES). Fall back to no -race only if that failed.
       - name: Tests
         shell: bash
