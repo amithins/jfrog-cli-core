@@ -3,8 +3,11 @@ package commands
 import (
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/jfrog/jfrog-cli-core/v2/utils/coreutils"
 
@@ -19,6 +22,11 @@ type CurlCommand struct {
 	executablePath string
 	serverDetails  *config.ServerDetails
 	url            string
+	// credConfigPath holds the path to a 0600 temp file that carries the
+	// server credential for the child curl process via `-K <path>`, so the
+	// secret never appears in argv (which is world-readable on Linux via
+	// /proc/<pid>/cmdline). Empty when no credential is being passed.
+	credConfigPath string
 }
 
 func NewCurlCommand() *CurlCommand {
@@ -73,15 +81,26 @@ func (curlCmd *CurlCommand) Run() error {
 	curlCmd.arguments[uriIndex] = targetUri
 
 	cmdWithoutCreds := strings.Join(curlCmd.arguments, " ")
-	// Add credentials to curl command.
-	credentialsMessage := curlCmd.addCommandCredentials()
+	// Add credentials to curl command via a 0600 temp config file (never argv).
+	credentialsMessage, err := curlCmd.addCommandCredentials()
+	if err != nil {
+		return err
+	}
+	defer curlCmd.cleanupCredentialsConfig()
+	stopSignalCleanup := curlCmd.removeCredentialsConfigOnSignal()
+	defer stopSignalCleanup()
 
 	// Run curl.
 	log.Debug(fmt.Sprintf("Executing curl command: '%s %s'", cmdWithoutCreds, credentialsMessage))
 	return gofrogcmd.RunCmd(curlCmd)
 }
 
-func (curlCmd *CurlCommand) addCommandCredentials() string {
+// addCommandCredentials wires the server credential into the curl invocation
+// without ever placing it on the child process's command line. Certificate
+// paths are not secrets and stay on argv; the password or bearer token is
+// written to a 0600 temp file that curl reads via `-K <path>`. The returned
+// string is a redacted description safe for the debug log.
+func (curlCmd *CurlCommand) addCommandCredentials() (string, error) {
 	certificateHelpPrefix := ""
 
 	if curlCmd.serverDetails.ClientCertPath != "" {
@@ -91,19 +110,120 @@ func (curlCmd *CurlCommand) addCommandCredentials() string {
 		certificateHelpPrefix = "--cert *** --key *** "
 	}
 
-	if curlCmd.serverDetails.AccessToken != "" {
-		// Add access token header.
-		tokenHeader := fmt.Sprintf("Authorization: Bearer %s", curlCmd.serverDetails.AccessToken)
-		curlCmd.arguments = append(curlCmd.arguments, "-H", tokenHeader)
-
-		return certificateHelpPrefix + "-H \"Authorization: Bearer ***\""
+	var configContent string
+	switch {
+	case curlCmd.serverDetails.AccessToken != "":
+		token, err := curlConfigValue(curlCmd.serverDetails.AccessToken)
+		if err != nil {
+			return "", err
+		}
+		configContent = fmt.Sprintf("header = \"Authorization: Bearer %s\"\n", token)
+	case curlCmd.serverDetails.User != "" || curlCmd.serverDetails.Password != "":
+		user, err := curlConfigValue(curlCmd.serverDetails.User)
+		if err != nil {
+			return "", err
+		}
+		password, err := curlConfigValue(curlCmd.serverDetails.Password)
+		if err != nil {
+			return "", err
+		}
+		configContent = fmt.Sprintf("user = \"%s:%s\"\n", user, password)
+	default:
+		return certificateHelpPrefix, nil
 	}
 
-	// Add credentials flag to Command. In case of flag duplication, the latter is used by Curl.
-	credFlag := fmt.Sprintf("-u%s:%s", curlCmd.serverDetails.User, curlCmd.serverDetails.Password)
-	curlCmd.arguments = append(curlCmd.arguments, credFlag)
+	path, err := writeCurlCredentialsConfig(configContent)
+	if err != nil {
+		return "", err
+	}
+	curlCmd.credConfigPath = path
+	curlCmd.arguments = append(curlCmd.arguments, "-K", path)
 
-	return certificateHelpPrefix + "-u***:***"
+	return certificateHelpPrefix + "-K ***", nil
+}
+
+// writeCurlCredentialsConfig writes the given curl config content to a new
+// temp file and returns its path. os.CreateTemp creates it with mode 0600.
+func writeCurlCredentialsConfig(content string) (string, error) {
+	tempFile, err := os.CreateTemp("", "jfrog-curl-config-*.txt")
+	if err != nil {
+		return "", errorutils.CheckError(err)
+	}
+	path := tempFile.Name()
+	if _, err := tempFile.WriteString(content); err != nil {
+		_ = tempFile.Close()
+		_ = os.Remove(path)
+		return "", errorutils.CheckError(err)
+	}
+	if err := tempFile.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", errorutils.CheckError(err)
+	}
+	return path, nil
+}
+
+// curlConfigValue prepares a credential for a double-quoted curl config value.
+// A line break would end the config line and make curl reject the file, so
+// surrounding ones (e.g. from a pasted secret) are trimmed and inner ones are an error.
+func curlConfigValue(v string) (string, error) {
+	v = strings.Trim(v, "\r\n")
+	if strings.ContainsAny(v, "\r\n") {
+		return "", errorutils.CheckErrorf("the configured server credentials contain a line break, which curl cannot read from its config file")
+	}
+	return escapeCurlConfigValue(v), nil
+}
+
+// escapeCurlConfigValue escapes a value so it is safe to place inside a
+// double-quoted curl config value. Only backslash and double-quote need
+// escaping per curl's config parser.
+func escapeCurlConfigValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `"`, `\"`)
+	return v
+}
+
+// exitOnSignal exits jf after an interrupt removed the credentials config file. A variable so tests can stub it.
+var exitOnSignal = os.Exit
+
+// removeCredentialsConfigOnSignal removes the credentials config file if jf is interrupted or
+// terminated while curl runs, since deferred cleanup doesn't run then. Call the returned function
+// once curl has finished.
+func (curlCmd *CurlCommand) removeCredentialsConfigOnSignal() (stop func()) {
+	path := curlCmd.credConfigPath
+	if path == "" {
+		return func() {}
+	}
+	signals := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case sig := <-signals:
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				log.Debug(fmt.Sprintf("Failed removing curl credentials config file: %s", err.Error()))
+			}
+			exitCode := 1
+			if s, ok := sig.(syscall.Signal); ok {
+				exitCode = 128 + int(s)
+			}
+			exitOnSignal(exitCode)
+		case <-done:
+		}
+	}()
+	return func() {
+		signal.Stop(signals)
+		close(done)
+	}
+}
+
+func (curlCmd *CurlCommand) cleanupCredentialsConfig() {
+	if curlCmd.credConfigPath == "" {
+		return
+	}
+	if err := os.Remove(curlCmd.credConfigPath); err != nil && !os.IsNotExist(err) {
+		log.Debug(fmt.Sprintf("Failed removing curl credentials config file: %s", err.Error()))
+	}
+	curlCmd.credConfigPath = ""
 }
 
 func (curlCmd *CurlCommand) buildCommandUrl(url string) (uriIndex int, uriValue string, err error) {

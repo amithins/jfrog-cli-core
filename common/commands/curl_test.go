@@ -1,8 +1,248 @@
 package commands
 
 import (
+	"os"
+	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/jfrog/jfrog-cli-core/v2/utils/config"
+	utilsTests "github.com/jfrog/jfrog-cli-core/v2/utils/tests"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// TestAddCommandCredentialsNoSecretsInArgv checks that the password or token never appears in the
+// curl argv (readable by other local users via ps or /proc/<pid>/cmdline), and is instead passed
+// in a 0600 config file referenced by -K.
+func TestAddCommandCredentialsNoSecretsInArgv(t *testing.T) {
+	tests := []struct {
+		name           string
+		details        *config.ServerDetails
+		secretMarkers  []string
+		expectHelp     string
+		expectConfigIn string
+	}{
+		{
+			name: "userPassword",
+			details: &config.ServerDetails{
+				User: "admin",
+				// jfrog-ignore - dummy password for tests
+				Password: "s3cret-p@ss\"w\\ord",
+			},
+			secretMarkers:  []string{"s3cret-p@ss", "s3cret-p@ss\"w\\ord"},
+			expectHelp:     "-K ***",
+			expectConfigIn: `user = "admin:s3cret-p@ss\"w\\ord"`,
+		},
+		{
+			name: "userOnly",
+			details: &config.ServerDetails{
+				User: "ad\"min\\",
+			},
+			secretMarkers:  []string{"ad\"min"},
+			expectHelp:     "-K ***",
+			expectConfigIn: `user = "ad\"min\\:"`,
+		},
+		{
+			name: "passwordOnly",
+			details: &config.ServerDetails{
+				// jfrog-ignore - dummy password for tests
+				Password: "only-password",
+			},
+			secretMarkers:  []string{"only-password"},
+			expectHelp:     "-K ***",
+			expectConfigIn: `user = ":only-password"`,
+		},
+		{
+			name: "passwordWithTrailingLineBreak",
+			details: &config.ServerDetails{
+				User: "admin",
+				// jfrog-ignore - dummy password for tests
+				Password: "pasted-password\r\n",
+			},
+			secretMarkers:  []string{"pasted-password"},
+			expectHelp:     "-K ***",
+			expectConfigIn: "user = \"admin:pasted-password\"\n",
+		},
+		{
+			name: "accessToken",
+			//#nosec G101 jfrog-ignore - Dummy token for tests.
+			details: &config.ServerDetails{
+				AccessToken: "eyJver=1.tokenPart2.tokenPart3",
+			},
+			secretMarkers:  []string{"eyJver=1.tokenPart2.tokenPart3"},
+			expectHelp:     "-K ***",
+			expectConfigIn: `header = "Authorization: Bearer eyJver=1.tokenPart2.tokenPart3"`,
+		},
+		{
+			name: "accessTokenWithQuoteAndBackslash",
+			//#nosec G101 jfrog-ignore - Dummy token for tests.
+			details: &config.ServerDetails{
+				AccessToken: `tok"en\part`,
+			},
+			secretMarkers:  []string{`tok"en`},
+			expectHelp:     "-K ***",
+			expectConfigIn: `header = "Authorization: Bearer tok\"en\\part"`,
+		},
+		{
+			name: "certificateAndCredentials",
+			details: &config.ServerDetails{
+				User: "admin",
+				// jfrog-ignore - dummy password for tests
+				Password:          "cert-password",
+				ClientCertPath:    "/etc/ssl/certs/client.pem",
+				ClientCertKeyPath: "/etc/ssl/private/client.key",
+			},
+			secretMarkers:  []string{"cert-password"},
+			expectHelp:     "--cert *** --key *** -K ***",
+			expectConfigIn: `user = "admin:cert-password"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := &CurlCommand{
+				executablePath: "curl",
+				serverDetails:  tc.details,
+				arguments:      []string{"-X", "GET", "api/system/ping"},
+			}
+
+			help, err := cmd.addCommandCredentials()
+			require.NoError(t, err)
+			defer cmd.cleanupCredentialsConfig()
+
+			assert.Equal(t, tc.expectHelp, help,
+				"debug help text should redact the secret")
+
+			execCmd := cmd.GetCmd()
+			joinedArgv := strings.Join(execCmd.Args, " ")
+			for _, secret := range tc.secretMarkers {
+				assert.NotContains(t, joinedArgv, secret,
+					"secret %q must not appear in argv (would be readable via /proc/<pid>/cmdline)", secret)
+			}
+
+			// Credential must be delivered via -K <path>, and the path must exist and be readable only by us.
+			kIdx := -1
+			for i, a := range execCmd.Args {
+				if a == "-K" {
+					kIdx = i
+					break
+				}
+			}
+			require.NotEqual(t, -1, kIdx, "expected `-K` to be appended to argv so curl reads credentials from a config file")
+			require.Less(t, kIdx+1, len(execCmd.Args), "-K must be followed by a path")
+			configPath := execCmd.Args[kIdx+1]
+			assert.NotEmpty(t, configPath)
+
+			body, err := os.ReadFile(configPath)
+			require.NoError(t, err, "curl credentials config file should exist while the command runs")
+			assert.Contains(t, string(body), tc.expectConfigIn,
+				"credentials config content should carry the expected curl-config line")
+
+			if runtime.GOOS != "windows" {
+				info, err := os.Stat(configPath)
+				require.NoError(t, err)
+				mode := info.Mode().Perm()
+				assert.Equal(t, os.FileMode(0600), mode,
+					"credentials config file must be created with 0600 mode so co-resident users cannot read it (got %o)", mode)
+			}
+		})
+	}
+}
+
+// TestAddCommandCredentialsRejectsInnerLineBreak checks that a credential with a line break
+// inside it is rejected, since curl can't read it from its config file.
+func TestAddCommandCredentialsRejectsInnerLineBreak(t *testing.T) {
+	cmd := &CurlCommand{
+		executablePath: "curl",
+		// jfrog-ignore - dummy password for tests
+		serverDetails: &config.ServerDetails{User: "admin", Password: "pass\nword"},
+		arguments:     []string{"-X", "GET", "api/system/ping"},
+	}
+	_, err := cmd.addCommandCredentials()
+	assert.ErrorContains(t, err, "line break")
+	assert.Empty(t, cmd.credConfigPath)
+	assert.NotContains(t, cmd.arguments, "-K")
+}
+
+// TestAddCommandCredentialsCleanupRemovesFile checks that cleanup deletes the credentials config
+// file, and that a second cleanup is a no-op.
+func TestAddCommandCredentialsCleanupRemovesFile(t *testing.T) {
+	cmd := &CurlCommand{
+		executablePath: "curl",
+		serverDetails:  &config.ServerDetails{User: "u", Password: "p"},
+		arguments:      []string{"-X", "GET", "api/system/ping"},
+	}
+	_, err := cmd.addCommandCredentials()
+	require.NoError(t, err)
+	path := cmd.credConfigPath
+	require.NotEmpty(t, path)
+	_, err = os.Stat(path)
+	require.NoError(t, err)
+
+	cmd.cleanupCredentialsConfig()
+
+	_, err = os.Stat(path)
+	assert.True(t, os.IsNotExist(err), "credentials config file must be removed after Run exits")
+	assert.Empty(t, cmd.credConfigPath)
+
+	cmd.cleanupCredentialsConfig()
+	assert.Empty(t, cmd.credConfigPath)
+}
+
+// TestGetServerDetailsExcludesRefreshableToken checks that a server with a password and a
+// refreshable access token resolves to the password. jf refreshes tokens only for its own HTTP
+// requests, so curl would otherwise get an expired token.
+func TestGetServerDetailsExcludesRefreshableToken(t *testing.T) {
+	cleanUp, err := utilsTests.SetJfrogHome()
+	require.NoError(t, err)
+	defer cleanUp()
+	require.NoError(t, config.SaveServersConf([]*config.ServerDetails{{
+		ServerId:       "refreshable",
+		ArtifactoryUrl: "https://acme.jfrog.io/artifactory/",
+		User:           "admin",
+		// jfrog-ignore - dummy password for tests
+		Password: "long-lived-password",
+		//#nosec G101 jfrog-ignore - Dummy token for tests.
+		AccessToken:             "expiring-token",
+		ArtifactoryRefreshToken: "refresh-token",
+	}}))
+
+	cmd := NewCurlCommand().SetArguments([]string{"-X", "GET", "--server-id=refreshable", "api/system/ping"})
+	details, err := cmd.GetServerDetails()
+	require.NoError(t, err)
+	assert.Empty(t, details.AccessToken)
+	assert.Equal(t, "long-lived-password", details.Password)
+}
+
+// TestAddCommandCredentialsNoCredentials confirms that when the server has
+// neither a token nor a user/password, no config file is written and no `-K`
+// flag is added.
+func TestAddCommandCredentialsNoCredentials(t *testing.T) {
+	cmd := &CurlCommand{
+		executablePath: "curl",
+		serverDetails:  &config.ServerDetails{ClientCertPath: "/etc/ssl/certs/client.pem", ClientCertKeyPath: "/etc/ssl/private/client.key"},
+		arguments:      []string{"-X", "GET", "api/system/ping"},
+	}
+	help, err := cmd.addCommandCredentials()
+	require.NoError(t, err)
+	defer cmd.cleanupCredentialsConfig()
+
+	assert.Empty(t, cmd.credConfigPath, "no credentials -> no temp file")
+	assert.Equal(t, "--cert *** --key *** ", help)
+	joinedArgv := strings.Join(cmd.arguments, " ")
+	assert.NotContains(t, joinedArgv, "-K",
+		"no credentials means no -K flag should be added")
+	// Cert path (not a secret) is still fine on argv.
+	assert.Contains(t, joinedArgv, "--cert /etc/ssl/certs/client.pem")
+}
+
+func TestEscapeCurlConfigValue(t *testing.T) {
+	assert.Equal(t, `plain`, escapeCurlConfigValue(`plain`))
+	assert.Equal(t, `has \"quote\"`, escapeCurlConfigValue(`has "quote"`))
+	assert.Equal(t, `back\\slash`, escapeCurlConfigValue(`back\slash`))
+	assert.Equal(t, `both\\ and \"`, escapeCurlConfigValue(`both\ and "`))
+}
 
 func TestFindNextArg(t *testing.T) {
 	command := &CurlCommand{}
