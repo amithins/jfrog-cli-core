@@ -83,7 +83,7 @@ jobs:
           # not yet available on GHES. Flip to false once the repo is migrated.
           - repo: jfrog-cli-security
             branch: dev
-            public: true
+            public: false
           - repo: jfrog-cli-artifactory
             branch: main
             public: false
