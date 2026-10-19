@@ -141,6 +141,86 @@ func TestCheckPluginsVersionAndConvertIfNeededRetightensAnAlreadyV1Directory(t *
 	assert.Equal(t, os.FileMode(0755), info.Mode().Perm())
 }
 
+// RTECO-2627: ChmodPluginsDirectoryContent retightened only the top-level plugin directory,
+// never the bin/ subdirectory that actually holds the executable - the one directory
+// plugins/commands/install.go's generic download routine creates with a umask-dependent
+// os.MkdirAll(..., 0777) and never retightens itself. Start from a deliberately insecure mode
+// to prove the function actively tightens bin/ too, rather than merely happening to be fine.
+func TestChmodPluginsDirectoryContentTightensBinSubdirectory(t *testing.T) {
+	if coreutils.IsWindows() {
+		return
+	}
+	cleanUpTempEnv := createTempEnvForPluginsTests(t)
+	defer cleanUpTempEnv()
+
+	pluginsDir, err := coreutils.GetJfrogPluginsDir()
+	assert.NoError(t, err)
+	somePluginBinDir := filepath.Join(pluginsDir, "some-plugin", coreutils.PluginsExecDirName)
+	assert.NoError(t, os.MkdirAll(somePluginBinDir, 0777))
+	// os.MkdirAll's mode is filtered by the process umask (0777 becomes 0755 under the common
+	// 022), so without this the test would pass even with the fix removed - force the actually
+	// insecure starting mode explicitly, regardless of umask.
+	assert.NoError(t, os.Chmod(somePluginBinDir, 0777))
+
+	assert.NoError(t, coreutils.ChmodPluginsDirectoryContent())
+
+	info, err := os.Stat(somePluginBinDir)
+	assert.NoError(t, err)
+	assert.Equal(t, os.FileMode(0755), info.Mode().Perm())
+}
+
+// os.Chmod follows a symlink and changes its target's mode, not the link itself. A planted
+// <plugin>/bin -> elsewhere symlink must be refused (logged and skipped), not silently chmod'd
+// through to whatever it points at - the same reasoning as jfrog-cli's chmodPluginBinDir, added
+// for the same ticket.
+func TestChmodPluginsDirectoryContentRefusesSymlinkedBinDirectory(t *testing.T) {
+	if coreutils.IsWindows() {
+		return
+	}
+	cleanUpTempEnv := createTempEnvForPluginsTests(t)
+	defer cleanUpTempEnv()
+
+	pluginsDir, err := coreutils.GetJfrogPluginsDir()
+	assert.NoError(t, err)
+	somePluginDir := filepath.Join(pluginsDir, "some-plugin")
+	assert.NoError(t, os.MkdirAll(somePluginDir, 0755))
+	target, err := os.MkdirTemp("", "chmod-symlink-target")
+	assert.NoError(t, err)
+	defer func() { assert.NoError(t, os.RemoveAll(target)) }()
+	assert.NoError(t, os.Chmod(target, 0700))
+	assert.NoError(t, os.Symlink(target, filepath.Join(somePluginDir, coreutils.PluginsExecDirName)))
+
+	assert.NoError(t, coreutils.ChmodPluginsDirectoryContent(),
+		"a symlinked bin/ must be skipped with a warning, not turned into a hard error")
+
+	info, err := os.Lstat(target)
+	assert.NoError(t, err)
+	assert.Equal(t, os.FileMode(0700), info.Mode().Perm(), "the symlink target's own permissions must be untouched")
+}
+
+// A plugin directory with no bin/ subdirectory yet (e.g. mid-install, or a plugin that never
+// shipped an executable) must not make ChmodPluginsDirectoryContent fail.
+func TestChmodPluginsDirectoryContentToleratesMissingBinSubdirectory(t *testing.T) {
+	if coreutils.IsWindows() {
+		return
+	}
+	cleanUpTempEnv := createTempEnvForPluginsTests(t)
+	defer cleanUpTempEnv()
+
+	pluginsDir, err := coreutils.GetJfrogPluginsDir()
+	assert.NoError(t, err)
+	somePluginDir := filepath.Join(pluginsDir, "some-plugin")
+	assert.NoError(t, os.MkdirAll(somePluginDir, 0777))
+	// Same umask-filtering reason as TestChmodPluginsDirectoryContentTightensBinSubdirectory above.
+	assert.NoError(t, os.Chmod(somePluginDir, 0777))
+
+	assert.NoError(t, coreutils.ChmodPluginsDirectoryContent())
+
+	info, err := os.Stat(somePluginDir)
+	assert.NoError(t, err)
+	assert.Equal(t, os.FileMode(0755), info.Mode().Perm())
+}
+
 func setupPluginsTestingEnv(t *testing.T, pluginsDirName string) string {
 	testHomeDir, err := coreutils.GetJfrogHomeDir()
 	assert.NoError(t, err)

@@ -406,12 +406,58 @@ func ChmodPluginsDirectoryContent() error {
 		// 0755, not 0777: these are directories holding plugin executables the CLI runs
 		// unconditionally on every invocation (see plugins/utils/signatureutils.go in
 		// jfrog-cli), so they must not be writable by any local account other than the owner.
-		err = os.Chmod(filepath.Join(pluginsDir, p.Name()), 0755)
+		pluginDir := filepath.Join(pluginsDir, p.Name())
+		err = os.Chmod(pluginDir, 0755)
 		if err != nil {
 			return err
 		}
+		// RTECO-2627: the bin/ subdirectory - which actually holds the executable
+		// signatureutils.getPluginsSignatures runs on every jf invocation - is created by the
+		// generic download routine with a umask-dependent os.MkdirAll(..., 0777) and was never
+		// retightened here, unlike the plugin directory above. Re-apply the same restricted mode
+		// to it on every call, the same way the plugin directory itself is re-tightened.
+		//
+		// Only a directory entry can have a bin/ subdirectory at all - a pre-migration V0 layout
+		// lists bare executable files directly under pluginsDir (see
+		// plugins.convertFileSystemLayoutV0ToV1), and stat-ing "<file>/bin" would fail with
+		// ENOTDIR, not "does not exist".
+		if p.IsDir() {
+			chmodPluginBinDirOrWarn(p.Name(), filepath.Join(pluginDir, PluginsExecDirName))
+		}
 	}
 	return nil
+}
+
+// chmodPluginBinDirOrWarn restricts binDir to 0755, logging a warning and continuing - never returning an
+// error - on anything that stops it from doing so.
+//
+// This is called from ChmodPluginsDirectoryContent, which runs on every `jf` invocation
+// (CheckPluginsVersionAndConvertIfNeeded's only caller is signatureutils.go in jfrog-cli, on every command).
+// A hard error for one plugin whose bin/ directory happens to be un-chmod-able - e.g. EPERM because another
+// local account now owns it, which is exactly the attack scenario RTECO-2627 is about - would otherwise
+// propagate out of that single pass and break `jf` entirely for every plugin, not just the compromised one.
+//
+// os.Chmod follows a symlink and changes its target's mode, not the link itself (the same reasoning as
+// jfrog-cli's chmodPluginBinDir, added for the same ticket): Lstat first and refuse a binDir that is not a
+// real, existing directory, rather than silently tightening permissions on whatever it points at.
+func chmodPluginBinDirOrWarn(pluginName, binDir string) {
+	info, err := os.Lstat(binDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Warn(fmt.Sprintf("Could not check plugin '%s' bin directory '%s', leaving its permissions "+
+				"unchanged: %s", pluginName, binDir, err.Error()))
+		}
+		return
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		log.Warn(fmt.Sprintf("Plugin '%s' bin directory '%s' is a symbolic link, refusing to change its "+
+			"target's permissions.", pluginName, binDir))
+		return
+	}
+	if err = os.Chmod(binDir, 0755); err != nil {
+		log.Warn(fmt.Sprintf("Could not restrict permissions of plugin '%s' bin directory '%s': %s",
+			pluginName, binDir, err.Error()))
+	}
 }
 
 func GetJfrogLocksDir() (string, error) {
