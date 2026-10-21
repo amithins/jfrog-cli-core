@@ -740,12 +740,22 @@ func getErrorOrDelayFiles(repoKeys []string, getDirPathFunc func(string) (string
 	return
 }
 
+// A file name is safe if it is a single local path segment (no separators, no drive or stream prefixes).
+func isSafeFileName(fileName string) bool {
+	return !strings.ContainsAny(fileName, `/\`) && filepath.IsLocal(fileName)
+}
+
 // Increments index until the file path is unique.
 func getUniqueErrorOrDelayFilePath(dirPath string, getFileNamePrefix func() string) (delayFilePath string, err error) {
 	var exists bool
 	index := 0
 	for {
-		delayFilePath = filepath.Join(dirPath, fmt.Sprintf("%s-%d.json", getFileNamePrefix(), index))
+		prefix := getFileNamePrefix()
+		fileName := fmt.Sprintf("%s-%d.json", prefix, index)
+		if prefix == "" || !isSafeFileName(fileName) {
+			return "", errorutils.CheckErrorf("invalid error or delay file name %q: must be a single path segment", fileName)
+		}
+		delayFilePath = filepath.Join(dirPath, fileName)
 		exists, err = fileutils.IsFileExists(delayFilePath, false)
 		if err != nil {
 			return "", err
