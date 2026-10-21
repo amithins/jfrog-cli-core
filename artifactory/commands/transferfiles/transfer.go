@@ -472,6 +472,11 @@ func (tdc *TransferFilesCommand) transferRepos(sourceRepos []string, targetRepos
 
 func (tdc *TransferFilesCommand) transferSingleRepo(sourceRepoKey string, targetRepos []string,
 	buildInfoRepo bool, newPhase *transferPhase, srcUpService *srcUserPluginService) (err error) {
+	// The repository key is used to build error and delay file names.
+	if !isSafeFileName(sourceRepoKey) {
+		log.Error(fmt.Sprintf("repository %q has a key that cannot be used as a local file name. Skipping...", sourceRepoKey))
+		return nil
+	}
 	if !slices.Contains(targetRepos, sourceRepoKey) {
 		log.Error("repository '" + sourceRepoKey + "' does not exist in target. Skipping...")
 		return

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -231,6 +232,7 @@ func TestUpdateMaxUniqueSnapshots(t *testing.T) {
 		default:
 			assert.Fail(t, "tried to update the Max Unique Snapshots setting of a repository of an unsupported package type")
 		}
+		// jfrog-ignore - false positive: plain-text mock server response in a test, not rendered as HTML
 		_, err = fmt.Fprintf(w, "Repository %s-local update successfully.", packageType)
 		assert.NoError(t, err)
 	})
@@ -433,6 +435,67 @@ func createUniqueFileAndAssertCounter(t *testing.T, tmpDir, prefix string, expec
 	assert.NoError(t, err)
 	assert.NoError(t, os.WriteFile(filePath, nil, 0644))
 	assert.True(t, strings.HasSuffix(filePath, strconv.Itoa(expectedCounter)+".json"))
+}
+
+func TestGetUniqueErrorOrDelayFilePathRejectsTraversal(t *testing.T) {
+	rootDir := t.TempDir()
+	dirPath := filepath.Join(rootDir, "a", "b", "c")
+	assert.NoError(t, os.MkdirAll(dirPath, 0755))
+
+	for _, prefix := range []string{"../../../x", "../x", "a/b", `a\b`, "./a/../../s", "/etc/x", ""} {
+		filePath, err := getUniqueErrorOrDelayFilePath(dirPath, func() string { return prefix })
+		assert.Error(t, err, "prefix %q", prefix)
+		assert.Empty(t, filePath, "prefix %q", prefix)
+	}
+
+	// Positive control: legitimate repository keys still resolve under dirPath.
+	// Artifactory forbids "." and ".." only as the whole key, so keys such as "libs..release" are valid.
+	for _, repoKey := range []string{"generic-local", "libs..release", "repo..", "a.b.c"} {
+		filePath, err := getUniqueErrorOrDelayFilePath(dirPath, func() string { return getErrorsFileNamePrefix(repoKey, 0, "123") })
+		assert.NoError(t, err, "repo key %q", repoKey)
+		assert.Equal(t, dirPath, filepath.Dir(filePath), "repo key %q", repoKey)
+		filePath, err = getUniqueErrorOrDelayFilePath(dirPath, func() string { return getDelaysFilePrefix(repoKey, "123") })
+		assert.NoError(t, err, "repo key %q", repoKey)
+		assert.Equal(t, dirPath, filepath.Dir(filePath), "repo key %q", repoKey)
+	}
+
+	// The raw repository key from the server must not escape dirPath through the prefix helpers.
+	_, err := getUniqueErrorOrDelayFilePath(dirPath, func() string { return getErrorsFileNamePrefix("../../../x", 0, "123") })
+	assert.Error(t, err)
+	_, err = getUniqueErrorOrDelayFilePath(dirPath, func() string { return getDelaysFilePrefix("../../../x", "123") })
+	assert.Error(t, err)
+}
+
+func TestIsSafeFileName(t *testing.T) {
+	for _, name := range []string{"a:b-0.json", "C:x-0.json", "a/b-0.json", `a\b-0.json`, ".."} {
+		if runtime.GOOS != "windows" && (strings.Contains(name, ":") && !strings.ContainsAny(name, `/\`)) {
+			continue // ':' is only special on Windows
+		}
+		assert.False(t, isSafeFileName(name), name)
+	}
+	assert.True(t, isSafeFileName("libs..release-0-123-0.json"))
+}
+
+// Writers fed with a malicious prefix must fail and leave no file anywhere outside dirPath.
+func TestWritersRejectTraversalPrefix(t *testing.T) {
+	rootDir := t.TempDir()
+	dirPath := filepath.Join(rootDir, "a", "b")
+	assert.NoError(t, os.MkdirAll(dirPath, 0755))
+
+	splitWriter := newSplitContentWriter("delayedArtifacts", 10, dirPath, "../x")
+	assert.NoError(t, splitWriter.writeRecord(map[string]string{"k": "v"}))
+	assert.Error(t, splitWriter.close())
+	assert.Empty(t, splitWriter.contentFiles)
+
+	mng := &TransferErrorsMng{repoKey: "../x", phaseStartTime: "123"}
+	_, _, err := mng.newUniqueContentWriter(dirPath)
+	assert.Error(t, err)
+
+	assert.NoError(t, filepath.WalkDir(rootDir, func(path string, d os.DirEntry, err error) error {
+		assert.NoError(t, err)
+		assert.NotEqual(t, ".json", filepath.Ext(path), "unexpected file %s", path)
+		return nil
+	}))
 }
 
 var updateThreadsProvider = []struct {

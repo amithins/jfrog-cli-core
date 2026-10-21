@@ -381,7 +381,8 @@ func (w *SplitContentWriter) closeCurrentFile() error {
 				return w.filePrefix
 			})
 			if err != nil {
-				return err
+				// The temp file was already written; don't leave it behind.
+				return errors.Join(err, errorutils.CheckError(os.Remove(w.writer.GetFilePath())))
 			}
 			log.Debug(fmt.Sprintf("Saving split content JSON file to: %s.", fullPath))
 			if err := fileutils.MoveFile(w.writer.GetFilePath(), fullPath); err != nil {
