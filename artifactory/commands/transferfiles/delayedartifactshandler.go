@@ -10,6 +10,7 @@ import (
 
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/coreutils"
+	"github.com/jfrog/jfrog-cli-core/v2/utils/reposnapshot"
 	"github.com/jfrog/jfrog-client-go/utils/errorutils"
 	"github.com/jfrog/jfrog-client-go/utils/io/content"
 	"github.com/jfrog/jfrog-client-go/utils/io/fileutils"
@@ -179,6 +180,7 @@ func consumeDelayedArtifactsFiles(pcWrapper *producerConsumerWrapper, filesToCon
 		if err != nil {
 			return err
 		}
+		delayedArtifactsFile.DelayedArtifacts = keepRecordsOfRepo(delayedArtifactsFile.DelayedArtifacts, base.repoKey, filePath, func(r api.FileRepresentation) string { return r.Repo })
 
 		shouldStop, err := uploadByChunks(delayedArtifactsFile.DelayedArtifacts, uploadChunkChan, base, delayHelper, errorsChannelMng, pcWrapper)
 		if err != nil || shouldStop {
@@ -385,7 +387,7 @@ func (w *SplitContentWriter) closeCurrentFile() error {
 				return errors.Join(err, errorutils.CheckError(os.Remove(w.writer.GetFilePath())))
 			}
 			log.Debug(fmt.Sprintf("Saving split content JSON file to: %s.", fullPath))
-			if err := fileutils.MoveFile(w.writer.GetFilePath(), fullPath); err != nil {
+			if err := reposnapshot.MoveFileAtomic(w.writer.GetFilePath(), fullPath); err != nil {
 				return fmt.Errorf("saving file failed! failed moving %s to %s: %w", w.writer.GetFilePath(), fullPath, err)
 			}
 			w.contentFiles = append(w.contentFiles, fullPath)

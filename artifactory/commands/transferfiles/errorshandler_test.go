@@ -153,6 +153,23 @@ func TestGetErrorsFiles(t *testing.T) {
 	assert.Len(t, paths, 5)
 }
 
+func TestGetErrorsFilesIgnoresAtomicTempFiles(t *testing.T) {
+	cleanUpJfrogHome, err := tests.SetJfrogHome()
+	assert.NoError(t, err)
+	defer cleanUpJfrogHome()
+
+	writeEmptyErrorsFile(t, repo1Key, true, 0, 0)
+	errorsDirPath, err := getJfrogTransferRepoRetryableDir(repo1Key)
+	assert.NoError(t, err)
+	// Simulate a writer that died before renaming its temp file into place.
+	assert.NoError(t, os.WriteFile(filepath.Join(errorsDirPath, ".record-0.json.tmp-123456"), []byte("{\"err"), 0600))
+
+	paths, err := getErrorsFiles([]string{repo1Key}, true)
+	assert.NoError(t, err)
+	assert.Len(t, paths, 1)
+	assert.Equal(t, ".json", filepath.Ext(paths[0]))
+}
+
 func writeEmptyErrorsFile(t *testing.T, repoKey string, retryable bool, phase, counter int) {
 	var errorsDirPath string
 	var err error

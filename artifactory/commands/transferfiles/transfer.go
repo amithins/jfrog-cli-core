@@ -563,7 +563,7 @@ func (tdc *TransferFilesCommand) initTransferDir() error {
 			return errorutils.CheckError(err)
 		}
 	}
-	return errorutils.CheckError(os.MkdirAll(transferDir, 0777))
+	return ensureOwnerOnlyRootDir(transferDir)
 }
 
 func (tdc *TransferFilesCommand) removeOldFilesIfNeeded(repos []string) error {

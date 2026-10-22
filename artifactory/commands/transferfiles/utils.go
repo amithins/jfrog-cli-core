@@ -735,7 +735,22 @@ func getErrorOrDelayFiles(repoKeys []string, getDirPathFunc func(string) (string
 		if err != nil {
 			return nil, err
 		}
-		filesPaths = append(filesPaths, files...)
+		// Skip leftover atomic-write temp files (e.g. ".name.json.tmp-*") that are not committed records,
+		// and anything that is not a regular file, so that symlinks are never followed.
+		for _, filePath := range files {
+			if filepath.Ext(filePath) != ".json" {
+				continue
+			}
+			info, err := os.Lstat(filePath)
+			if err != nil {
+				return nil, errorutils.CheckError(err)
+			}
+			if !info.Mode().IsRegular() {
+				log.Warn(fmt.Sprintf("Ignoring '%s': not a regular file.", filePath))
+				continue
+			}
+			filesPaths = append(filesPaths, filePath)
+		}
 	}
 	return
 }
@@ -756,7 +771,7 @@ func getUniqueErrorOrDelayFilePath(dirPath string, getFileNamePrefix func() stri
 			return "", errorutils.CheckErrorf("invalid error or delay file name %q: must be a single path segment", fileName)
 		}
 		delayFilePath = filepath.Join(dirPath, fileName)
-		exists, err = fileutils.IsFileExists(delayFilePath, false)
+		exists, err = pathTaken(delayFilePath)
 		if err != nil {
 			return "", err
 		}
@@ -954,4 +969,55 @@ func generatePatternOrConditionForAnd(patterns []string) string {
 	}
 
 	return `,{"$or":[` + strings.Join(conditions, ",") + `]}`
+}
+
+// Reports whether any entry, including a dangling symlink, occupies the path.
+func pathTaken(p string) (bool, error) {
+	_, err := os.Lstat(p)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, errorutils.CheckError(err)
+}
+
+// Creates the directory (and parents) if needed and restricts it to owner-only access regardless of umask.
+// A symlink at dirPath is refused.
+func ensureOwnerOnlyDir(dirPath string) error {
+	return ensureOwnerOnlyDirImpl(dirPath, true)
+}
+
+// Like ensureOwnerOnlyDir, but follows a symlink at dirPath and tightens its target,
+// so that the transfer root can be relocated to another volume.
+func ensureOwnerOnlyRootDir(dirPath string) error {
+	return ensureOwnerOnlyDirImpl(dirPath, false)
+}
+
+func ensureOwnerOnlyDirImpl(dirPath string, preserveSymLink bool) error {
+	if err := os.MkdirAll(dirPath, 0700); err != nil {
+		return errorutils.CheckError(err)
+	}
+	info, err := fileutils.GetFileInfo(dirPath, preserveSymLink)
+	if err != nil {
+		return errorutils.CheckError(err)
+	}
+	if !info.IsDir() {
+		return errorutils.CheckErrorf("'%s' is not a directory", dirPath)
+	}
+	return errorutils.CheckError(os.Chmod(dirPath, 0700))
+}
+
+// Drops records that do not belong to repoKey, so that planted records cannot trigger transfers of other repositories.
+func keepRecordsOfRepo[T any](records []T, repoKey, filePath string, getRepo func(T) string) []T {
+	kept := records[:0]
+	for _, r := range records {
+		if getRepo(r) != repoKey {
+			log.Warn(fmt.Sprintf("Ignoring a record of repository '%s' found in '%s' while transferring repository '%s'.", getRepo(r), filePath, repoKey))
+			continue
+		}
+		kept = append(kept, r)
+	}
+	return kept
 }

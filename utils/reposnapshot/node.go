@@ -2,8 +2,11 @@ package reposnapshot
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"sync"
 
 	"github.com/jfrog/jfrog-client-go/utils/errorutils"
@@ -233,7 +236,52 @@ func (node *Node) convertAndSaveToFile(stateFilePath string) error {
 	if err != nil {
 		return errorutils.CheckError(err)
 	}
-	return errorutils.CheckError(os.WriteFile(stateFilePath, content, 0644))
+	return WriteFileAtomic(stateFilePath, content)
+}
+
+// WriteFileAtomic writes content to a temp file created in the destination's directory with mode 0600,
+// and renames it over destPath. A symlink at destPath is replaced rather than followed.
+func WriteFileAtomic(destPath string, content []byte) (err error) {
+	return writeAtomic(destPath, func(f *os.File) error {
+		_, err := f.Write(content)
+		return err
+	})
+}
+
+// MoveFileAtomic copies srcPath into destPath using WriteFileAtomic semantics and removes srcPath.
+func MoveFileAtomic(srcPath, destPath string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return errorutils.CheckError(err)
+	}
+	err = writeAtomic(destPath, func(f *os.File) error {
+		_, err := io.Copy(f, src)
+		return err
+	})
+	err = errors.Join(err, errorutils.CheckError(src.Close()))
+	if err != nil {
+		return err
+	}
+	return errorutils.CheckError(os.Remove(srcPath))
+}
+
+func writeAtomic(destPath string, write func(*os.File) error) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(destPath), "."+filepath.Base(destPath)+".tmp-*")
+	if err != nil {
+		return errorutils.CheckError(err)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	err = write(tmp)
+	err = errors.Join(err, tmp.Chmod(0600), tmp.Close())
+	if err != nil {
+		return errorutils.CheckError(err)
+	}
+	return errorutils.CheckError(os.Rename(tmpPath, destPath))
 }
 
 // Marks that all contents of the node have been found and added.

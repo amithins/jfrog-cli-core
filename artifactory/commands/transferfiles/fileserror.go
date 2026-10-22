@@ -72,6 +72,7 @@ func (e *errorsRetryPhase) handleErrorsFile(errFilePath string, pcWrapper *produ
 	if err != nil {
 		return err
 	}
+	failedFiles.Errors = keepRecordsOfRepo(failedFiles.Errors, e.repoKey, errFilePath, func(r ExtendedFileUploadStatusResponse) string { return r.Repo })
 
 	if e.progressBar != nil {
 		// Since we're about to handle the transfer retry of the failed files,

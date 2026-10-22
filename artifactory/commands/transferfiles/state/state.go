@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/coreutils"
+	"github.com/jfrog/jfrog-cli-core/v2/utils/reposnapshot"
 	"github.com/jfrog/jfrog-client-go/utils/errorutils"
 	"github.com/jfrog/jfrog-client-go/utils/io/fileutils"
 	"github.com/jfrog/jfrog-client-go/utils/log"
@@ -93,11 +94,7 @@ func (ts *TransferState) persistTransferState(snapshot bool) (err error) {
 		return errorutils.CheckError(err)
 	}
 
-	err = os.WriteFile(repoStateFilePath, content, 0600)
-	if err != nil {
-		return errorutils.CheckError(err)
-	}
-	return nil
+	return reposnapshot.WriteFileAtomic(repoStateFilePath, content)
 }
 
 func (ts *TransferState) IsRepoTransferred() (isTransferred bool, err error) {
@@ -112,10 +109,17 @@ func LoadTransferState(repoKey string, snapshot bool) (transferState TransferSta
 	if err != nil {
 		return
 	}
-	exists, err = fileutils.IsFileExists(stateFilePath, false)
-	if err != nil || !exists {
-		return
+	info, err := os.Lstat(stateFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return transferState, false, nil
+		}
+		return transferState, false, errorutils.CheckError(err)
 	}
+	if !info.Mode().IsRegular() {
+		return transferState, false, errorutils.CheckErrorf("refusing to load transfer state file '%s': not a regular file", stateFilePath)
+	}
+	exists = true
 
 	content, err := fileutils.ReadFile(stateFilePath)
 	if err != nil {

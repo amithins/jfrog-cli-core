@@ -7,9 +7,9 @@ import (
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/api"
 	"github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/transferfiles/state"
 	cmdutils "github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/utils"
+	"github.com/jfrog/jfrog-cli-core/v2/utils/reposnapshot"
 	"github.com/jfrog/jfrog-client-go/utils/errorutils"
 	"github.com/jfrog/jfrog-client-go/utils/io/content"
-	"github.com/jfrog/jfrog-client-go/utils/io/fileutils"
 	"github.com/jfrog/jfrog-client-go/utils/log"
 	"os"
 	"path"
@@ -96,14 +96,7 @@ func initTransferErrorsDir(repoKey string) error {
 }
 
 func makeDirIfDoesNotExists(path string) error {
-	exists, err := fileutils.IsDirExists(path, false)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		err = os.Mkdir(path, 0777)
-	}
-	return err
+	return ensureOwnerOnlyDir(path)
 }
 
 func (mng *TransferErrorsMng) start() (err error) {
@@ -255,7 +248,7 @@ func (writerMng *errorWriter) closeWriter() error {
 
 	if writerMng.writer.GetFilePath() != "" {
 		log.Debug(fmt.Sprintf("Saving errors outpt to: %s.", writerMng.filePath))
-		err = fileutils.MoveFile(writerMng.writer.GetFilePath(), writerMng.filePath)
+		err = reposnapshot.MoveFileAtomic(writerMng.writer.GetFilePath(), writerMng.filePath)
 		if err != nil {
 			err = fmt.Errorf("saving error file failed! failed moving %s to %s: %w", writerMng.writer.GetFilePath(), writerMng.filePath, err)
 		}
