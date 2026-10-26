@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -35,6 +36,14 @@ const (
 	importPollingInterval               = 10 * time.Second
 	interruptedByUserErr                = "Config transfer was cancelled"
 	minTransferConfigArtifactoryVersion = "6.23.21"
+	exportDirNotFoundErr                = "couldn't find the export directory in '%s'. " +
+		"The Artifactory service user most likely didn't have permission to write to this directory. " +
+		"Run this command as root or as the Artifactory service user (shared.user in system.yaml, 'artifactory' by default). " +
+		"As root, the export directory is given to the group of the Artifactory var directory, found through the JFROG_HOME environment variable. " +
+		"sudo drops JFROG_HOME, so use 'sudo JFROG_HOME=<path> jf ...' or 'sudo -E jf ...'. " +
+		"As root, you may also set the JFROG_CLI_TEMP_DIR environment variable or the --source-working-dir option to a directory group-owned by the Artifactory service group with mode 2770 (setgid), " +
+		"for example a directory mounted at the same path into the Artifactory container, group-owned by the container's service GID. " +
+		"Otherwise, please make sure to run this command inside the source Artifactory machine"
 )
 
 type TransferConfigCommand struct {
@@ -45,10 +54,12 @@ type TransferConfigCommand struct {
 	preChecks        bool
 	sourceWorkingDir string
 	targetWorkingDir string
+	// The uid of the Artifactory service user whose group was given to the export directory, or -1
+	serviceOwner int
 }
 
 func NewTransferConfigCommand(sourceServer, targetServer *config.ServerDetails) *TransferConfigCommand {
-	return &TransferConfigCommand{TransferConfigBase: *commandsUtils.NewTransferConfigBase(sourceServer, targetServer)}
+	return &TransferConfigCommand{TransferConfigBase: *commandsUtils.NewTransferConfigBase(sourceServer, targetServer), serviceOwner: -1}
 }
 
 func (tcc *TransferConfigCommand) CommandName() string {
@@ -131,8 +142,13 @@ func (tcc *TransferConfigCommand) Run() (err error) {
 		return
 	}
 
+	// Re-verify the export base directory is still private before reading from it
+	if err = validateExportBaseDir(filepath.Dir(exportPath)); err != nil {
+		return
+	}
+
 	// Create an archive of the source Artifactory export in memory
-	archiveConfig, err := archiveConfig(exportPath, configXml)
+	archiveConfig, err := archiveConfig(exportPath, configXml, tcc.serviceOwner)
 	if err != nil {
 		return
 	}
@@ -186,7 +202,23 @@ func (tcc *TransferConfigCommand) createExportPath() (exportPath string, unsetTe
 		return "", unsetTempDir, err
 	}
 
-	return exportPath, unsetTempDir, errorutils.CheckError(os.Chmod(exportPath, 0777))
+	// The Artifactory service account must be able to write here, so allow the group but never others.
+	// The sticky bit prevents other group members from renaming or removing the export written by Artifactory.
+	// Keep the setgid bit inherited from a setgid base directory, so the export keeps the group chosen by the operator.
+	mode := exportDirMode | os.ModeSticky
+	if parentHasSetgid(exportPath) {
+		mode |= os.ModeSetgid
+	}
+	if err = errorutils.CheckError(os.Chmod(exportPath, mode)); err != nil {
+		return exportPath, unsetTempDir, err
+	}
+	setServiceGroup(exportPath)
+	// Only root trusts the service user, a non-root CLI trusts only itself and root.
+	// The var directory identifies the service user even if the group of the export directory came from a setgid base directory.
+	if geteuid() == 0 {
+		tcc.serviceOwner = lookupServiceOwner()
+	}
+	return exportPath, unsetTempDir, validateExportBaseDir(exportPath)
 }
 
 func (tcc *TransferConfigCommand) runPreChecks() error {
@@ -351,8 +383,17 @@ func (tcc *TransferConfigCommand) exportSourceArtifactory() (string, func() erro
 		Verbose:         &tcc.verbose,
 		ExcludeContent:  clientutils.Pointer(true),
 	}
-	cleanUp := func() error { return fileutils.RemoveTempDir(exportPath) }
+	cleanUp := func() error {
+		err := fileutils.RemoveTempDir(exportPath)
+		if err != nil {
+			log.Warn(fmt.Sprintf("Couldn't remove the export directory '%s'. It contains the Artifactory keys, please delete it (as root or as the Artifactory service user).", exportPath))
+		}
+		return err
+	}
 	if err = tcc.SourceArtifactoryManager.Export(exportParams); err != nil {
+		return "", cleanUp, err
+	}
+	if err = validateExportBaseDir(exportPath); err != nil {
 		return "", cleanUp, err
 	}
 
@@ -362,14 +403,34 @@ func (tcc *TransferConfigCommand) exportSourceArtifactory() (string, func() erro
 		return "", cleanUp, err
 	}
 	if len(files) == 0 {
-		return "", cleanUp, errorutils.CheckErrorf("couldn't find the export directory in '%s'. Please make sure to run this command inside the source Artifactory machine", exportPath)
+		return "", cleanUp, errorutils.CheckErrorf(exportDirNotFoundErr, exportPath)
 	}
 	if len(files) > 1 {
 		return "", cleanUp, errorutils.CheckErrorf("only the exported directory is expected to be in the export directory %s, but found %q", exportPath, files)
 	}
+	if err = tcc.recordExportOwner(files[0]); err != nil {
+		return "", cleanUp, err
+	}
 
 	// Return the export directory and the cleanup function
 	return files[0], cleanUp, nil
+}
+
+// If root doesn't know the Artifactory service user, record the owner of the directory Artifactory exported to, right after the
+// export. archiveConfig then requires that owner, so a directory planted by a member of the export directory group is rejected.
+func (tcc *TransferConfigCommand) recordExportOwner(exportDir string) error {
+	if tcc.serviceOwner >= 0 || geteuid() != 0 {
+		return nil
+	}
+	info, err := os.Lstat(exportDir)
+	if err != nil {
+		return errorutils.CheckError(err)
+	}
+	if uid, ok := fileOwnerUid(info); ok {
+		tcc.serviceOwner = uid
+		log.Debug(fmt.Sprintf("Expecting the export entries to be owned by uid %d, the owner of '%s'", uid, exportDir))
+	}
+	return nil
 }
 
 // Import from the input buffer to the target Artifactory

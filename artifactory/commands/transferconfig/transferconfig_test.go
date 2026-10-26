@@ -3,10 +3,12 @@ package transferconfig
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -39,6 +41,7 @@ func TestExportSourceArtifactory(t *testing.T) {
 		assert.Nil(t, actual.M2)
 
 		// Create the export-dir in the export path
+		// jfrog-ignore - false positive: test-only mock server, ExportPath is the temp dir created by this test.
 		assert.NoError(t, os.Mkdir(filepath.Join(actual.ExportPath, "export-dir"), os.ModePerm))
 	})
 	defer testServer.Close()
@@ -178,6 +181,40 @@ func TestVerifyConfigImportPluginForbidden(t *testing.T) {
 	assert.ErrorContains(t, err, "Response from Artifactory: 403 Forbidden.")
 }
 
+// Return the export path the CLI sent in the export request.
+func transferExportPathFromRequest(t *testing.T, r *http.Request) string {
+	content, err := io.ReadAll(r.Body)
+	assert.NoError(t, err)
+	var actual services.ExportBody
+	assert.NoError(t, json.Unmarshal(content, &actual))
+	return actual.ExportPath
+}
+
+func TestExportSourceArtifactoryEmptyExportDir(t *testing.T) {
+	// Like the real Artifactory when its service user can't write to the export path: HTTP 200, the failure is reported
+	// only in the response body, and nothing is created in the export path.
+	var exportPath string
+	testServer, serverDetails, _ := commonTests.CreateRtRestsMockServer(t, func(w http.ResponseWriter, r *http.Request) {
+		exportPath = transferExportPathFromRequest(t, r)
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write([]byte("500 : Failed to create backup dir: permission denied"))
+		assert.NoError(t, err)
+	})
+	defer testServer.Close()
+
+	tmpDir, createTempDirCallback := tests.CreateTempDirWithCallbackAndAssert(t)
+	defer createTempDirCallback()
+
+	transferConfigCmd := createTransferConfigCommand(t, serverDetails, nil).SetSourceWorkingDir(tmpDir)
+	_, cleanUp, err := transferConfigCmd.exportSourceArtifactory()
+	assert.NoError(t, cleanUp())
+	assert.True(t, strings.HasPrefix(exportPath, tmpDir))
+	if assert.EqualError(t, err, fmt.Sprintf(exportDirNotFoundErr, exportPath)) {
+		// Only root or the Artifactory service user can complete the export
+		assert.Contains(t, err.Error(), "as root or as the Artifactory service user")
+	}
+}
+
 func TestCreateExportPath(t *testing.T) {
 	transferConfigBase := NewTransferConfigCommand(nil, nil)
 
@@ -202,6 +239,12 @@ func TestCreateExportPath(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, strings.HasPrefix(exportPath, tmpDir))
 	assert.DirExists(t, exportPath)
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(exportPath)
+		assert.NoError(t, err)
+		assert.Equal(t, os.FileMode(0770), info.Mode().Perm(), "export dir must not be accessible to other users")
+		assert.NotZero(t, info.Mode()&os.ModeSticky, "group members must not rename or remove the entries of others")
+	}
 
 	// Ensure unsetTempDir did work
 	assert.NotContains(t, fileutils.GetTempDirBase(), testExportDir)
