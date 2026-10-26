@@ -3,6 +3,9 @@ package commandsummary
 import (
 	"fmt"
 	"net/url"
+	"strings"
+
+	"github.com/jfrog/jfrog-client-go/utils/errorutils"
 )
 
 const (
@@ -31,7 +34,10 @@ func GenerateEvidenceUrlByType(data EvidenceSummaryData, section summarySection)
 }
 
 func generateArtifactEvidenceUrl(pathInRt string, section summarySection) (string, error) {
-	urlStr := fmt.Sprintf(artifactEvidenceFormat, StaticMarkdownConfig.GetPlatformUrl(), pathInRt)
+	if err := validatePathSegments(strings.Split(pathInRt, "/")...); err != nil {
+		return "", err
+	}
+	urlStr := fmt.Sprintf(artifactEvidenceFormat, StaticMarkdownConfig.GetPlatformUrl(), escapePathSegments(pathInRt))
 	return addGitHubTrackingToUrl(urlStr, section)
 }
 
@@ -42,9 +48,9 @@ func generateReleaseBundleEvidenceUrl(data EvidenceSummaryData, section summaryS
 
 	urlStr := fmt.Sprintf(releaseBundleEvidenceFormat,
 		StaticMarkdownConfig.GetPlatformUrl(),
-		data.ReleaseBundleName,
-		data.RepoKey,
-		data.ReleaseBundleVersion)
+		url.QueryEscape(data.ReleaseBundleName),
+		url.QueryEscape(data.RepoKey),
+		url.QueryEscape(data.ReleaseBundleVersion))
 
 	return addGitHubTrackingToUrl(urlStr, section)
 }
@@ -53,11 +59,14 @@ func generateApplicationEvidenceUrl(data EvidenceSummaryData, section summarySec
 	if data.ApplicationKey == "" || data.ApplicationVersion == "" {
 		return generateArtifactEvidenceUrl(data.Subject, section)
 	}
+	if err := validatePathSegments(data.ApplicationKey, data.ApplicationVersion); err != nil {
+		return "", err
+	}
 
 	urlStr := fmt.Sprintf(applicationEvidenceFormat,
 		StaticMarkdownConfig.GetPlatformUrl(),
-		data.ApplicationKey,
-		data.ApplicationVersion)
+		url.PathEscape(data.ApplicationKey),
+		url.PathEscape(data.ApplicationVersion))
 
 	return addGitHubTrackingToUrl(urlStr, section)
 }
@@ -66,13 +75,36 @@ func generateBuildEvidenceUrl(data EvidenceSummaryData, section summarySection) 
 	if data.BuildName == "" || data.BuildNumber == "" || data.BuildTimestamp == "" {
 		return generateArtifactEvidenceUrl(data.Subject, section)
 	}
+	if err := validatePathSegments(data.BuildName, data.BuildNumber, data.BuildTimestamp); err != nil {
+		return "", err
+	}
 
 	urlStr := fmt.Sprintf(buildEvidenceFormat,
 		StaticMarkdownConfig.GetPlatformUrl(),
 		url.QueryEscape(data.BuildName),
-		data.BuildNumber,
-		data.BuildTimestamp,
-		data.RepoKey)
+		url.PathEscape(data.BuildNumber),
+		url.PathEscape(data.BuildTimestamp),
+		url.QueryEscape(data.RepoKey))
 
 	return addGitHubTrackingToUrl(urlStr, section)
+}
+
+// escapePathSegments escapes each segment of a repository path, keeping the "/" separators.
+func escapePathSegments(path string) string {
+	segments := strings.Split(path, "/")
+	for i, segment := range segments {
+		segments[i] = url.PathEscape(segment)
+	}
+	return strings.Join(segments, "/")
+}
+
+// validatePathSegments rejects "." and ".." segments. Escaping does not help, since browsers also treat
+// "%2e" and "%2e%2e" as dot segments and resolve them, which would point the link at a different page.
+func validatePathSegments(segments ...string) error {
+	for _, segment := range segments {
+		if segment == "." || segment == ".." {
+			return errorutils.CheckErrorf("cannot generate an evidence link for a path containing the %q segment", segment)
+		}
+	}
+	return nil
 }

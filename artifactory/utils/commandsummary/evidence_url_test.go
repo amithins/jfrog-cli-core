@@ -1,10 +1,12 @@
 package commandsummary
 
 import (
+	"net/url"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGenerateEvidenceUrlByType(t *testing.T) {
@@ -154,6 +156,147 @@ func TestGenerateEvidenceUrlByType(t *testing.T) {
 					assert.Contains(t, url, "range=Any+Time")
 				}
 			}
+		})
+	}
+}
+
+func TestGenerateEvidenceUrlByTypeEscapesValues(t *testing.T) {
+	StaticMarkdownConfig.setPlatformUrl("https://myplatform.com/")
+	StaticMarkdownConfig.setPlatformMajorVersion(7)
+
+	tests := []struct {
+		name                string
+		data                EvidenceSummaryData
+		expectedPath        string
+		expectedEscapedPath string
+		expectedQuery       map[string]string
+	}{
+		{
+			name: "Artifact subject with query and fragment characters",
+			data: EvidenceSummaryData{
+				Subject:     "repo/dir?x=1/file #1%.txt",
+				SubjectType: SubjectTypeArtifact,
+			},
+			expectedPath:        "/ui/repos/tree/Evidence/repo/dir?x=1/file #1%.txt",
+			expectedEscapedPath: "/ui/repos/tree/Evidence/repo/dir%3Fx=1/file%20%231%25.txt",
+			expectedQuery:       map[string]string{"clearFilter": "true"},
+		},
+		{
+			name: "Release bundle fields with query delimiters",
+			data: EvidenceSummaryData{
+				Subject:              "release-bundles-v2/my-bundle/1.0.0/release-bundle.json.evd",
+				SubjectType:          SubjectTypeReleaseBundle,
+				ReleaseBundleName:    "my-bundle&repositoryKey=other",
+				ReleaseBundleVersion: "1.0.0#frag",
+				RepoKey:              "release-bundles-v2&releaseBundleVersion=9",
+			},
+			expectedPath:        "/ui/artifactory/lifecycle",
+			expectedEscapedPath: "/ui/artifactory/lifecycle",
+			expectedQuery: map[string]string{
+				"bundleName":           "my-bundle&repositoryKey=other",
+				"repositoryKey":        "release-bundles-v2&releaseBundleVersion=9",
+				"releaseBundleVersion": "1.0.0#frag",
+			},
+		},
+		{
+			name: "Application fields with path delimiters",
+			data: EvidenceSummaryData{
+				Subject:            "app-versions/my-app/1.0.0/application-version.json.evd",
+				SubjectType:        SubjectTypeApplication,
+				ApplicationKey:     "../my-app",
+				ApplicationVersion: "1.0.0?activeVersionTab=Other",
+			},
+			expectedPath:        "/ui/applications/management/../my-app/versions/1.0.0?activeVersionTab=Other",
+			expectedEscapedPath: "/ui/applications/management/..%2Fmy-app/versions/1.0.0%3FactiveVersionTab=Other",
+			expectedQuery:       map[string]string{"activeVersionTab": "Content Graph"},
+		},
+		{
+			name: "Build fields with path and query delimiters",
+			data: EvidenceSummaryData{
+				Subject:        "artifactory-build-info/my-build/123/1234567890.json",
+				SubjectType:    SubjectTypeBuild,
+				BuildName:      "my-build",
+				BuildNumber:    "1/2#3",
+				BuildTimestamp: "1234567890?x=y",
+				RepoKey:        "artifactory-build-info&buildRepo=other",
+			},
+			expectedPath:        "/ui/builds/my-build/1/2#3/1234567890?x=y/Evidence",
+			expectedEscapedPath: "/ui/builds/my-build/1%2F2%233/1234567890%3Fx=y/Evidence",
+			expectedQuery:       map[string]string{"buildRepo": "artifactory-build-info&buildRepo=other"},
+		},
+	}
+
+	for _, workflow := range []string{"", "JFrog CLI Core Tests"} {
+		for _, tt := range tests {
+			t.Run(tt.name+"/workflow="+workflow, func(t *testing.T) {
+				t.Setenv(workflowEnvKey, workflow)
+				evidenceUrl, err := GenerateEvidenceUrlByType(tt.data, evidenceSection)
+				require.NoError(t, err)
+
+				parsedUrl, err := url.Parse(evidenceUrl)
+				require.NoError(t, err)
+				assert.Equal(t, "myplatform.com", parsedUrl.Host)
+				assert.Equal(t, tt.expectedPath, parsedUrl.Path)
+				assert.Equal(t, tt.expectedEscapedPath, parsedUrl.EscapedPath())
+				assert.Empty(t, parsedUrl.Fragment)
+				query := parsedUrl.Query()
+				for key, value := range tt.expectedQuery {
+					assert.Equal(t, []string{value}, query[key], key)
+				}
+			})
+		}
+	}
+}
+
+func TestGenerateEvidenceUrlByTypeRejectsDotSegments(t *testing.T) {
+	StaticMarkdownConfig.setPlatformUrl("https://myplatform.com/")
+	StaticMarkdownConfig.setPlatformMajorVersion(7)
+
+	tests := []struct {
+		name string
+		data EvidenceSummaryData
+	}{
+		{
+			name: "Artifact subject",
+			data: EvidenceSummaryData{Subject: "repo/../other-repo/file.txt", SubjectType: SubjectTypeArtifact},
+		},
+		{
+			name: "Application version",
+			data: EvidenceSummaryData{
+				Subject:            "app-versions/my-app/1.0.0/application-version.json.evd",
+				SubjectType:        SubjectTypeApplication,
+				ApplicationKey:     "my-app",
+				ApplicationVersion: ".",
+			},
+		},
+		{
+			name: "Build number",
+			data: EvidenceSummaryData{
+				Subject:        "artifactory-build-info/my-build/123/1234567890.json",
+				SubjectType:    SubjectTypeBuild,
+				BuildName:      "my-build",
+				BuildNumber:    "..",
+				BuildTimestamp: "1234567890",
+			},
+		},
+		{
+			name: "Build name",
+			data: EvidenceSummaryData{
+				Subject:        "artifactory-build-info/my-build/123/1234567890.json",
+				SubjectType:    SubjectTypeBuild,
+				BuildName:      "..",
+				BuildNumber:    "123",
+				BuildTimestamp: "1234567890",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			evidenceUrl, err := GenerateEvidenceUrlByType(tt.data, evidenceSection)
+			assert.Error(t, err)
+			assert.Empty(t, evidenceUrl)
+			assert.NotContains(t, (&EvidenceSummary{}).formatSubjectWithLink(tt.data), "<a ")
 		})
 	}
 }
