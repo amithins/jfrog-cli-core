@@ -100,6 +100,21 @@ func TestImportToTargetArtifactoryPollingErrorIsNotATimeout(t *testing.T) {
 	assert.Empty(t, fake.timeoutRefUsed)
 }
 
+// A polling action that stops with an error ends the wait with that error, even when the error is of the timeout type:
+// the plugin action returns the HTTP client's retry timeout when a status request keeps failing with 5xx.
+// Only a polling that never stopped is a polling timeout.
+func TestImportToTargetArtifactoryStoppedPollingIsNotATimeout(t *testing.T) {
+	cmd := createTransferConfigCommand(t, nil, &config.ServerDetails{Url: "http://target-dummy/", ArtifactoryUrl: "http://target-dummy/artifactory/"})
+	fake := &fakeImporter{timeout: time.Minute, timeoutErr: errors.New("must not be used")}
+	cmd.importer = fake
+	clientRetriesExhausted := clientutils.RetryExecutorTimeoutError{}
+	stopping := func() (bool, []byte, error) { return true, nil, clientRetriesExhausted }
+
+	err := cmd.waitForImportCompletion("ref-9", stopping)
+	assert.Equal(t, clientRetriesExhausted, err)
+	assert.Empty(t, fake.timeoutRefUsed, "a stopped polling must not be reported as a polling timeout")
+}
+
 func TestPluginImporterPollingTimeout(t *testing.T) {
 	importer := newPluginImporter(createTransferConfigCommand(t, nil, &config.ServerDetails{}))
 	assert.Equal(t, 10*time.Minute, importer.pollingTimeout(), "the plugin keeps its timeout")

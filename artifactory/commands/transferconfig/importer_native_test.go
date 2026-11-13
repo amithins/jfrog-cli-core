@@ -279,10 +279,16 @@ func TestNativeImporterStartLockedNamesTheRunningImport(t *testing.T) {
 		expected    []string
 		notExpected []string
 	}{
-		{"with active id", `{"message":"Config import in process","activeId":"abc-123"}`,
-			[]string{"already running", "abc-123", "Wait for it to finish"}, nil},
-		{"without active id", `{"message":"Config import in process"}`,
-			[]string{"already running", "Config import in process", "Wait for it to finish"}, []string{"import id"}},
+		// The status URL of the running import is checked separately, since it depends on the mock server URL.
+		// With an id, the server message adds nothing and is left out.
+		{"with active id", `{"message":"Another config transfer import is in progress","activeId":"abc-123"}`,
+			[]string{"already running", "abc-123", "Wait for it to finish"}, []string{"Another config transfer import is in progress"}},
+		// Another POST holds the lock while it starts its import: the server has no id to give yet
+		{"without active id", `{"message":"Another config transfer import is in progress"}`,
+			[]string{"already running", "Another config transfer import is in progress", "Wait for it to finish"}, []string{"import id"}},
+		// A JSON body with neither field is reported as is
+		{"neither field", `{"other":"value"}`,
+			[]string{"423", `"other"`}, []string{"already running"}},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -305,7 +311,20 @@ func TestNativeImporterStartLockedNamesTheRunningImport(t *testing.T) {
 	}
 }
 
-// The native import may run up to the server's 60 min bound, after which the server reports it interrupted (500)
+// The import of a 423 names the running import with the URL of its status. That import may be this command's own,
+// when an earlier start attempt was accepted but its response was lost.
+func TestNativeImporterStartLockedPointsToTheRunningImportStatus(t *testing.T) {
+	importer, _, _ := newNativeImporterWithMock(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+		respondNative(w, http.StatusLocked, `{"message":"Another config transfer import is in progress","activeId":"abc-123"}`)
+	})
+	_, err := importer.start(bytes.NewBufferString("zip"))
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), importer.statusUrl("abc-123"))
+	}
+}
+
+// The CLI stops waiting after this limit. The server keeps a live import running (202) on the node that runs it,
+// whatever its duration, so this is a bound on the wait and not a server-side guarantee.
 func TestNativeImporterPollingTimeout(t *testing.T) {
 	importer := newNativeImporter(createTransferConfigCommand(t, &config.ServerDetails{Url: "dummy-url"}, &config.ServerDetails{Url: "dummy-url"}))
 	assert.Equal(t, 65*time.Minute, importer.pollingTimeout())
@@ -324,8 +343,65 @@ func TestNativeImporterPollingTimeoutErrorNamesTheImport(t *testing.T) {
 		assert.Contains(t, err.Error(), "http://target/artifactory/api/configTransfer/import/a%2Fb%20c")
 		assert.Contains(t, err.Error(), "may still be running")
 		assert.Contains(t, err.Error(), "65 minutes")
+		assert.Contains(t, err.Error(), "repositories were not imported", "the skipped phase must be named")
+		assert.Contains(t, err.Error(), "source Artifactory credentials", "the import replaces the target users")
 	}
 	assert.ErrorAs(t, err, &timeoutErr, "the timeout error must stay inspectable")
+}
+
+// An import reported interrupted (500) may still be running: in HA, another node marks it interrupted after the maximum
+// duration and frees the lock, while the node that runs it continues. The error must say so, so that the user does not
+// start a second import alongside it. Other 500s (an aborted import) are reported as before.
+func TestNativeImporterPollingInterruptedImportMayStillRun(t *testing.T) {
+	testCases := []struct {
+		name        string
+		body        string
+		mayStillRun bool
+	}{
+		{"interrupted", "Config import i1 was interrupted: node ct-node left the cluster", true},
+		{"aborted", "Config import i1 aborted: Import failed", false},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			importer, _, _ := newNativeImporterWithMock(t, func(index int, w http.ResponseWriter, _ *http.Request) {
+				if index == 0 {
+					respondNative(w, http.StatusAccepted, `{"id":"i1"}`)
+					return
+				}
+				respondNative(w, http.StatusInternalServerError, testCase.body)
+			})
+			action := startNativeImporter(t, importer, "i1")
+			stop, _, err := action()
+			assert.True(t, stop)
+			if assert.Error(t, err) {
+				assert.Contains(t, err.Error(), testCase.body, "the server error must be kept")
+				if testCase.mayStillRun {
+					assert.Contains(t, err.Error(), "may still be running")
+					assert.Contains(t, err.Error(), importer.statusUrl("i1"))
+				} else {
+					assert.NotContains(t, err.Error(), "may still be running")
+				}
+			}
+		})
+	}
+}
+
+// The switch to the source credentials is logged, so that a 401/403 seen on the target is explained in the CLI output
+func TestNativeImporterPollingLogsTheCredentialsSwitch(t *testing.T) {
+	logs := redirectLogs(t)
+	importer, _, _ := newNativeImporterWithMock(t, func(index int, w http.ResponseWriter, _ *http.Request) {
+		switch index {
+		case 0:
+			respondNative(w, http.StatusAccepted, `{"id":"i1"}`)
+		default:
+			respondNative(w, http.StatusUnauthorized, "")
+		}
+	})
+	action := startNativeImporter(t, importer, "i1")
+	stop, _, err := action()
+	assert.NoError(t, err)
+	assert.False(t, stop)
+	assert.Contains(t, logs.String(), "Switching to the source Artifactory credentials")
 }
 
 func TestNativeImporterStartRetriesOnServerError(t *testing.T) {

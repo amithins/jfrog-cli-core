@@ -36,9 +36,10 @@ const (
 	nativeStartMinUploadBytesPerSec = 64 * 1024
 )
 
-// The maximum time to wait for the native import to complete. The server interrupts an import that runs longer than
-// configTransfer.import.maxDurationMinutes (60 by default) and then reports it as failed (500), which ends the polling
-// before this limit. The margin covers the polling interval and a late server-side detection.
+// The maximum time to wait for the native import to complete. It only bounds the wait of the CLI: on the node that runs
+// it, the server reports a live import as running (202) whatever its duration. configTransfer.import.maxDurationMinutes
+// (60 by default) is enforced only by the other nodes of an HA cluster, which then report the import interrupted (500)
+// although it may still be running. In both cases the error tells the user that the import may still be running.
 const nativeImportPollingTimeout = 65 * time.Minute
 
 // nativeImporter imports the config using the config transfer API that is built into the target Artifactory,
@@ -128,8 +129,22 @@ func (n *nativeImporter) pollingTimeout() time.Duration {
 // The error therefore names the import and the URL of its status.
 func (n *nativeImporter) pollingTimeoutError(importRef string, timeoutErr error) error {
 	return errorutils.CheckError(fmt.Errorf("the config import %s did not complete within %d minutes. It may still be running on the target Artifactory. "+
-		"Its status is available at %s. Wait for it to finish before running the command again: %w",
+		"Its status is available at %s (the import replaces the target users, so checking it may require the source Artifactory credentials). "+
+		"The repositories were not imported to the target, since the command stopped before that phase. "+
+		"Wait for the import to finish before running the command again: %w",
 		importRef, int(nativeImportPollingTimeout.Minutes()), n.statusUrl(importRef), timeoutErr))
+}
+
+// Returns the error of a status request that failed with the given status. A 500 for an import that the server reports
+// interrupted does not mean that the import stopped: in HA, another node marks a long import interrupted and frees the
+// lock while the node that runs it continues. The error says so, so that a second import is not started alongside it.
+func (n *nativeImporter) pollingStatusError(importRef string, resp *http.Response, body []byte) error {
+	err := errorutils.CheckResponseStatusWithBody(resp, body, http.StatusOK)
+	if resp.StatusCode == http.StatusInternalServerError && bytes.Contains(body, []byte("was interrupted")) {
+		return errorutils.CheckError(fmt.Errorf("%w\nThe target Artifactory reports the config import %s as interrupted, but the import may still be running. "+
+			"Check its status at %s, and wait for it to finish before running the command again", err, importRef, n.statusUrl(importRef)))
+	}
+	return err
 }
 
 // The URL of the status of the import with the given id
@@ -139,8 +154,11 @@ func (n *nativeImporter) statusUrl(importRef string) string {
 }
 
 // Returns the error of a start request rejected with 423, because another import is running on the target.
-// The server names the running import in activeId. A body that cannot be read is reported as is.
-func lockedImportError(resp *http.Response, body []byte) error {
+// The server names the running import in activeId, which is pointed to with the URL of its status: the running import
+// may be this command's own, when an earlier start attempt was accepted but its response was lost.
+// Without an id (another request is starting an import right now), the server message is shown.
+// A body that cannot be read is reported as is.
+func (n *nativeImporter) lockedImportError(resp *http.Response, body []byte) error {
 	var lockedResponse struct {
 		Message  string `json:"message"`
 		ActiveId string `json:"activeId"`
@@ -148,12 +166,12 @@ func lockedImportError(resp *http.Response, body []byte) error {
 	if err := json.Unmarshal(body, &lockedResponse); err != nil || (lockedResponse.Message == "" && lockedResponse.ActiveId == "") {
 		return errorutils.CheckResponseStatusWithBody(resp, body, http.StatusAccepted)
 	}
-	runningImport := "another config import"
 	if lockedResponse.ActiveId != "" {
-		runningImport = fmt.Sprintf("another config import (import id %s)", lockedResponse.ActiveId)
+		return errorutils.CheckErrorf("another config import (import id %s) is already running on the target Artifactory. Its status is available at %s. "+
+			"Wait for it to finish, then run the command again", lockedResponse.ActiveId, n.statusUrl(lockedResponse.ActiveId))
 	}
-	return errorutils.CheckErrorf("%s is already running on the target Artifactory: %s. Wait for it to finish, then run the command again",
-		runningImport, lockedResponse.Message)
+	return errorutils.CheckErrorf("another config import is already running on the target Artifactory: %s. Wait for it to finish, then run the command again",
+		lockedResponse.Message)
 }
 
 // The native API needs no target-side preparation: the admin permission is enforced by the server on start(),
@@ -204,7 +222,7 @@ func (n *nativeImporter) start(zip *bytes.Buffer) (importRef string, err error) 
 				return true, err
 			}
 			if resp.StatusCode == http.StatusLocked {
-				return false, lockedImportError(resp, body)
+				return false, n.lockedImportError(resp, body)
 			}
 			if resp.StatusCode != http.StatusAccepted {
 				// Only server errors are retried. Others, such as 403 (not an admin) and 423 (an import is already running), are final.
@@ -271,6 +289,8 @@ func (n *nativeImporter) pollingAction(importRef string) httputils.PollingAction
 			if n.credentialsSwitched {
 				return true, nil, errorutils.CheckResponseStatusWithBody(resp, body, http.StatusOK)
 			}
+			log.Info(fmt.Sprintf("[Config import] The target Artifactory rejected the target credentials (%s), as expected after the import replaced its users. "+
+				"Switching to the source Artifactory credentials.", resp.Status))
 			if n.rtDetails, err = n.tcc.switchTargetToSourceCredentials(); err != nil {
 				return true, nil, err
 			}
@@ -281,8 +301,8 @@ func (n *nativeImporter) pollingAction(importRef string) httputils.PollingAction
 			log.Warn(fmt.Sprintf("[Config import] The target Artifactory is temporarily unavailable (%s), will try again.", resp.Status))
 			return false, nil, nil
 		default:
-			// 404 - unknown or expired import id, 500 - the import failed, or any other unexpected status
-			return true, nil, errorutils.CheckResponseStatusWithBody(resp, body, http.StatusOK)
+			// 404 - unknown or expired import id, 500 - the import failed or was interrupted, or any other unexpected status
+			return true, nil, n.pollingStatusError(importRef, resp, body)
 		}
 	}
 }
