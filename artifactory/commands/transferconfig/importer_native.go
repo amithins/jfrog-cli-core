@@ -36,6 +36,11 @@ const (
 	nativeStartMinUploadBytesPerSec = 64 * 1024
 )
 
+// The maximum time to wait for the native import to complete. The server interrupts an import that runs longer than
+// configTransfer.import.maxDurationMinutes (60 by default) and then reports it as failed (500), which ends the polling
+// before this limit. The margin covers the polling interval and a late server-side detection.
+const nativeImportPollingTimeout = 65 * time.Minute
+
 // nativeImporter imports the config using the config transfer API that is built into the target Artifactory,
 // without the config-import user plugin.
 type nativeImporter struct {
@@ -115,6 +120,42 @@ func newNativeImporter(tcc *TransferConfigCommand) *nativeImporter {
 	}
 }
 
+func (n *nativeImporter) pollingTimeout() time.Duration {
+	return nativeImportPollingTimeout
+}
+
+// The import keeps running on the target after the CLI stops waiting, and a new import is rejected (423) until it ends.
+// The error therefore names the import and the URL of its status.
+func (n *nativeImporter) pollingTimeoutError(importRef string, timeoutErr error) error {
+	return errorutils.CheckError(fmt.Errorf("the config import %s did not complete within %d minutes. It may still be running on the target Artifactory. "+
+		"Its status is available at %s. Wait for it to finish before running the command again: %w",
+		importRef, int(nativeImportPollingTimeout.Minutes()), n.statusUrl(importRef), timeoutErr))
+}
+
+// The URL of the status of the import with the given id
+func (n *nativeImporter) statusUrl(importRef string) string {
+	artifactoryUrl := clientutils.AddTrailingSlashIfNeeded(n.tcc.TargetServerDetails.GetArtifactoryUrl())
+	return artifactoryUrl + configTransferImportRestApi + "/" + url.PathEscape(importRef)
+}
+
+// Returns the error of a start request rejected with 423, because another import is running on the target.
+// The server names the running import in activeId. A body that cannot be read is reported as is.
+func lockedImportError(resp *http.Response, body []byte) error {
+	var lockedResponse struct {
+		Message  string `json:"message"`
+		ActiveId string `json:"activeId"`
+	}
+	if err := json.Unmarshal(body, &lockedResponse); err != nil || (lockedResponse.Message == "" && lockedResponse.ActiveId == "") {
+		return errorutils.CheckResponseStatusWithBody(resp, body, http.StatusAccepted)
+	}
+	runningImport := "another config import"
+	if lockedResponse.ActiveId != "" {
+		runningImport = fmt.Sprintf("another config import (import id %s)", lockedResponse.ActiveId)
+	}
+	return errorutils.CheckErrorf("%s is already running on the target Artifactory: %s. Wait for it to finish, then run the command again",
+		runningImport, lockedResponse.Message)
+}
+
 // The native API needs no target-side preparation: the admin permission is enforced by the server on start(),
 // and the emptiness of the target is checked by the command.
 func (n *nativeImporter) verify() error {
@@ -162,6 +203,9 @@ func (n *nativeImporter) start(zip *bytes.Buffer) (importRef string, err error) 
 				// Transport error
 				return true, err
 			}
+			if resp.StatusCode == http.StatusLocked {
+				return false, lockedImportError(resp, body)
+			}
 			if resp.StatusCode != http.StatusAccepted {
 				// Only server errors are retried. Others, such as 403 (not an admin) and 423 (an import is already running), are final.
 				return resp.StatusCode >= http.StatusInternalServerError, errorutils.CheckResponseStatusWithBody(resp, body, http.StatusAccepted)
@@ -195,8 +239,7 @@ func (n *nativeImporter) start(zip *bytes.Buffer) (importRef string, err error) 
 
 // Returns the action that polls the status of the import, identified by the id returned from start().
 func (n *nativeImporter) pollingAction(importRef string) httputils.PollingAction {
-	artifactoryUrl := clientutils.AddTrailingSlashIfNeeded(n.tcc.TargetServerDetails.GetArtifactoryUrl())
-	statusUrl := artifactoryUrl + configTransferImportRestApi + "/" + url.PathEscape(importRef)
+	statusUrl := n.statusUrl(importRef)
 	return func() (shouldStop bool, responseBody []byte, err error) {
 		if n.rtDetails == nil {
 			if n.rtDetails, err = commandsUtils.CreateArtifactoryClientDetails(n.tcc.TargetArtifactoryManager); err != nil {

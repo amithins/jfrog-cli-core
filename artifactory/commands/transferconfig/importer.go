@@ -2,6 +2,7 @@ package transferconfig
 
 import (
 	"bytes"
+	"time"
 
 	"github.com/jfrog/jfrog-client-go/utils/io/httputils"
 )
@@ -17,4 +18,8 @@ type configImporter interface {
 	start(zip *bytes.Buffer) (importRef string, err error)
 	// Returns the polling action used by waitForImportCompletion
 	pollingAction(importRef string) httputils.PollingAction
+	// The maximum time to wait for the import to complete
+	pollingTimeout() time.Duration
+	// Returns the error to report when waiting for the import identified by importRef times out
+	pollingTimeoutError(importRef string, timeoutErr error) error
 }

@@ -13,6 +13,7 @@ import (
 	commonTests "github.com/jfrog/jfrog-cli-core/v2/common/tests"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/config"
 	utilsTests "github.com/jfrog/jfrog-cli-core/v2/utils/tests"
+	clientutils "github.com/jfrog/jfrog-client-go/utils"
 	"github.com/jfrog/jfrog-client-go/utils/io/httputils"
 	"github.com/jfrog/jfrog-client-go/utils/log"
 	"github.com/stretchr/testify/assert"
@@ -268,6 +269,63 @@ func TestNativeImporterStartFailsWithoutRetry(t *testing.T) {
 			assert.Len(t, mock.recorded(), 1)
 		})
 	}
+}
+
+// 423 means another import is running on the target. The server names it with activeId, which the error shows.
+func TestNativeImporterStartLockedNamesTheRunningImport(t *testing.T) {
+	testCases := []struct {
+		name        string
+		body        string
+		expected    []string
+		notExpected []string
+	}{
+		{"with active id", `{"message":"Config import in process","activeId":"abc-123"}`,
+			[]string{"already running", "abc-123", "Wait for it to finish"}, nil},
+		{"without active id", `{"message":"Config import in process"}`,
+			[]string{"already running", "Config import in process", "Wait for it to finish"}, []string{"import id"}},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			importer, _, mock := newNativeImporterWithMock(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				respondNative(w, http.StatusLocked, testCase.body)
+			})
+			ref, err := importer.start(bytes.NewBufferString("zip"))
+			assert.Empty(t, ref)
+			assert.Len(t, mock.recorded(), 1, "a running import is final, start must not be retried")
+			if assert.Error(t, err) {
+				for _, text := range testCase.expected {
+					assert.Contains(t, err.Error(), text)
+				}
+				for _, text := range testCase.notExpected {
+					assert.NotContains(t, err.Error(), text)
+				}
+			}
+		})
+	}
+}
+
+// The native import may run up to the server's 60 min bound, after which the server reports it interrupted (500)
+func TestNativeImporterPollingTimeout(t *testing.T) {
+	importer := newNativeImporter(createTransferConfigCommand(t, &config.ServerDetails{Url: "dummy-url"}, &config.ServerDetails{Url: "dummy-url"}))
+	assert.Equal(t, 65*time.Minute, importer.pollingTimeout())
+}
+
+// A timed out native import may still be running on the target: the error names it and where to check its status
+func TestNativeImporterPollingTimeoutErrorNamesTheImport(t *testing.T) {
+	cmd := createTransferConfigCommand(t, &config.ServerDetails{Url: "dummy-url"},
+		&config.ServerDetails{Url: "http://target/", ArtifactoryUrl: "http://target/artifactory/"})
+	importer := newNativeImporter(cmd)
+	timeoutErr := clientutils.RetryExecutorTimeoutError{}
+
+	err := importer.pollingTimeoutError("a/b c", timeoutErr)
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "a/b c")
+		assert.Contains(t, err.Error(), "http://target/artifactory/api/configTransfer/import/a%2Fb%20c")
+		assert.Contains(t, err.Error(), "may still be running")
+		assert.Contains(t, err.Error(), "65 minutes")
+	}
+	assert.ErrorAs(t, err, &timeoutErr, "the timeout error must stay inspectable")
 }
 
 func TestNativeImporterStartRetriesOnServerError(t *testing.T) {

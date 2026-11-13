@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	commandUtils "github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/utils"
 	commonTests "github.com/jfrog/jfrog-cli-core/v2/common/tests"
 	"github.com/jfrog/jfrog-cli-core/v2/utils/config"
+	clientutils "github.com/jfrog/jfrog-client-go/utils"
 	"github.com/jfrog/jfrog-client-go/utils/io/httputils"
 	"github.com/stretchr/testify/assert"
 )
@@ -22,11 +24,28 @@ type fakeImporter struct {
 	importRef       string
 	pollingResponse []byte
 
+	// The polling never reports completion, so only the polling timeout can end it
+	neverCompletes bool
+	timeout        time.Duration
+	timeoutErr     error
+
 	verifyCalls    int
 	startCalls     int
 	startedZip     string
 	pollingCalls   int
 	pollingRefUsed string
+	timeoutRefUsed string
+	timeoutErrIn   error
+}
+
+func (f *fakeImporter) pollingTimeout() time.Duration {
+	return f.timeout
+}
+
+func (f *fakeImporter) pollingTimeoutError(importRef string, timeoutErr error) error {
+	f.timeoutRefUsed = importRef
+	f.timeoutErrIn = timeoutErr
+	return f.timeoutErr
 }
 
 func (f *fakeImporter) verify() error {
@@ -44,8 +63,48 @@ func (f *fakeImporter) pollingAction(importRef string) httputils.PollingAction {
 	f.pollingCalls++
 	f.pollingRefUsed = importRef
 	return func() (bool, []byte, error) {
+		if f.neverCompletes {
+			return false, nil, nil
+		}
 		return true, f.pollingResponse, nil
 	}
+}
+
+// The command waits as long as the importer says, and lets the importer describe the timeout.
+// With the fixed 10 min of the command, this test would hang: the guard makes that a fast failure.
+func TestImportToTargetArtifactoryUsesImporterPollingTimeout(t *testing.T) {
+	cmd := createTransferConfigCommand(t, nil, &config.ServerDetails{Url: "http://target-dummy/", ArtifactoryUrl: "http://target-dummy/artifactory/"})
+	described := errors.New("import ref-7 timed out, described by the importer")
+	fake := &fakeImporter{importRef: "ref-7", neverCompletes: true, timeout: time.Nanosecond, timeoutErr: described}
+	cmd.importer = fake
+
+	var err error
+	runNativeWithin(t, hangTestGuard, "the import polling", func() {
+		err = cmd.importToTargetArtifactory(bytes.NewBufferString("zip-content"))
+	})
+	assert.Same(t, described, err, "the error described by the importer must be returned")
+	assert.Equal(t, "ref-7", fake.timeoutRefUsed)
+	var timeoutErr clientutils.RetryExecutorTimeoutError
+	assert.ErrorAs(t, fake.timeoutErrIn, &timeoutErr, "the importer must get the polling timeout error")
+}
+
+// Errors other than the polling timeout are not passed to the importer's timeout description
+func TestImportToTargetArtifactoryPollingErrorIsNotATimeout(t *testing.T) {
+	cmd := createTransferConfigCommand(t, nil, &config.ServerDetails{Url: "http://target-dummy/", ArtifactoryUrl: "http://target-dummy/artifactory/"})
+	pollErr := errors.New("import failed")
+	fake := &fakeImporter{importRef: "ref-8", timeout: time.Minute, timeoutErr: errors.New("must not be used")}
+	cmd.importer = fake
+	failing := func() (bool, []byte, error) { return true, nil, pollErr }
+
+	assert.Same(t, pollErr, cmd.waitForImportCompletion("ref-8", failing))
+	assert.Empty(t, fake.timeoutRefUsed)
+}
+
+func TestPluginImporterPollingTimeout(t *testing.T) {
+	importer := newPluginImporter(createTransferConfigCommand(t, nil, &config.ServerDetails{}))
+	assert.Equal(t, 10*time.Minute, importer.pollingTimeout(), "the plugin keeps its timeout")
+	timeoutErr := clientutils.RetryExecutorTimeoutError{}
+	assert.Equal(t, timeoutErr, importer.pollingTimeoutError("123", timeoutErr), "the plugin reports its timeout as is")
 }
 
 func TestNewTransferConfigCommandUsesPluginImporter(t *testing.T) {

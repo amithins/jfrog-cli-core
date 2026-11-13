@@ -352,14 +352,14 @@ func (tcc *TransferConfigCommand) importToTargetArtifactory(buffer *bytes.Buffer
 	}
 
 	// Wait for config import completion
-	return tcc.waitForImportCompletion(tcc.importer.pollingAction(importRef))
+	return tcc.waitForImportCompletion(importRef, tcc.importer.pollingAction(importRef))
 }
 
-func (tcc *TransferConfigCommand) waitForImportCompletion(pollingAction httputils.PollingAction) error {
+func (tcc *TransferConfigCommand) waitForImportCompletion(importRef string, pollingAction httputils.PollingAction) error {
 	artifactoryUrl := clientutils.AddTrailingSlashIfNeeded(tcc.TargetServerDetails.GetArtifactoryUrl())
 
 	pollingExecutor := &httputils.PollingExecutor{
-		Timeout:         importPollingTimeout,
+		Timeout:         tcc.importer.pollingTimeout(),
 		PollingInterval: importPollingInterval,
 		MsgPrefix:       "Waiting for config import completion in Artifactory server at " + artifactoryUrl,
 		PollingAction:   pollingAction,
@@ -367,6 +367,11 @@ func (tcc *TransferConfigCommand) waitForImportCompletion(pollingAction httputil
 
 	body, err := pollingExecutor.Execute()
 	if err != nil {
+		// The polling actions never return an error to keep polling, so a timeout error means that the polling timed out
+		var timeoutErr clientutils.RetryExecutorTimeoutError
+		if errors.As(err, &timeoutErr) {
+			return tcc.importer.pollingTimeoutError(importRef, err)
+		}
 		return err
 	}
 	log.Info(fmt.Sprintf("Logs from Artifactory:\n%s", body))
