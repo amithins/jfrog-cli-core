@@ -65,12 +65,26 @@ func (tcc *TransferConfigCommand) resolveImporter(targetArtifactoryVersion strin
 
 	chosenMethod := ConfigTransferMethodPlugin
 	tcc.importer = newPluginImporter(tcc)
+	tcc.pluginChosenByAuto = method == ConfigTransferMethodAuto && !useNative
+	tcc.targetArtifactoryVersion = targetArtifactoryVersion
 	if useNative {
 		chosenMethod = ConfigTransferMethodNative
 		tcc.importer = newNativeImporter(tcc)
 	}
 	log.Info(fmt.Sprintf("Config transfer method: %s (target Artifactory version %s, native API minimum %s).", chosenMethod, targetArtifactoryVersion, minNativeConfigTransferVersion))
 	return nil
+}
+
+// Adds a hint to a failed verification of the plugin, when the auto method chose the plugin by the target version.
+// Such a target may include the native config transfer API although its version is below the expected minimum
+// (for example, before the minimum version is known), and then has no reason to have the config-import plugin installed.
+func (tcc *TransferConfigCommand) hintNativeMethod(verifyErr error) error {
+	if !tcc.pluginChosenByAuto {
+		return verifyErr
+	}
+	return errorutils.CheckError(fmt.Errorf("%w\nHint: the config-import plugin method was chosen automatically, because the target Artifactory version %s is lower than %s. "+
+		"If the target Artifactory includes the native config transfer API, run the command again with --config-transfer-method=%s",
+		verifyErr, tcc.targetArtifactoryVersion, minNativeConfigTransferVersion, ConfigTransferMethodNative))
 }
 
 // usesNativeImporter returns true if the command imports the config using the native config transfer API.

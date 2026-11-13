@@ -2,6 +2,7 @@ package transferconfig
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -199,6 +200,47 @@ func TestValidateMinVersionUnknownMethodFails(t *testing.T) {
 	_, err := cmd.validateMinVersion()
 	assert.ErrorContains(t, err, "bogus")
 	assert.ErrorContains(t, err, "auto")
+}
+
+// When the auto method falls back to the plugin and the plugin verification fails, the error hints at the native method:
+// the target may include the native API although its version is below the expected minimum. An explicitly requested
+// method gets no hint, and the original error is kept.
+func TestValidateTargetServerHintsNativeMethodWhenAutoPluginFails(t *testing.T) {
+	pluginErr := errors.New("Response from Artifactory: 400 Bad Request.")
+	testCases := []struct {
+		name      string
+		method    ConfigTransferMethod
+		version   string
+		verifyErr error
+		hinted    bool
+	}{
+		{"auto fell back to the plugin", ConfigTransferMethodAuto, targetBelowNativeMin, pluginErr, true},
+		{"plugin requested explicitly", ConfigTransferMethodPlugin, targetAboveNativeMin, pluginErr, false},
+		{"auto chose native", ConfigTransferMethodAuto, targetAboveNativeMin, pluginErr, false},
+		{"auto fell back to the plugin, verification passed", ConfigTransferMethodAuto, targetBelowNativeMin, nil, false},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			cmd := createTransferConfigCommand(t, &config.ServerDetails{Url: "dummy-url"}, &config.ServerDetails{Url: "dummy-url"}).
+				SetConfigTransferMethod(testCase.method).SetForce(true)
+			assert.NoError(t, cmd.resolveImporter(testCase.version))
+			// The verification of the chosen importer is replaced, to fail without a server
+			cmd.importer = &fakeImporter{verifyErr: testCase.verifyErr}
+
+			err := cmd.validateTargetServer()
+			if testCase.verifyErr == nil {
+				assert.NoError(t, err)
+				return
+			}
+			assert.ErrorIs(t, err, testCase.verifyErr, "the verification error must be kept")
+			if testCase.hinted {
+				assert.ErrorContains(t, err, "--config-transfer-method=native")
+				assert.ErrorContains(t, err, targetBelowNativeMin)
+			} else {
+				assert.NotContains(t, err.Error(), "--config-transfer-method")
+			}
+		})
+	}
 }
 
 // The importer is not resolved if the version validation fails

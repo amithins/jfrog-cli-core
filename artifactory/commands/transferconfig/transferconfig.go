@@ -46,6 +46,9 @@ type TransferConfigCommand struct {
 	targetWorkingDir string
 	importer         configImporter
 	method           ConfigTransferMethod
+	// Set by resolveImporter: whether the auto method chose the plugin, and the target version it was chosen by
+	pluginChosenByAuto       bool
+	targetArtifactoryVersion string
 }
 
 func NewTransferConfigCommand(sourceServer, targetServer *config.ServerDetails) *TransferConfigCommand {
@@ -255,7 +258,7 @@ func (tcc *TransferConfigCommand) printWarnings() (err error) {
 func (tcc *TransferConfigCommand) validateTargetServer() error {
 	// Verify the target server is ready for the import (plugin: the config-import plugin is installed and the user is admin)
 	if err := tcc.importer.verify(); err != nil {
-		return err
+		return tcc.hintNativeMethod(err)
 	}
 
 	if tcc.force {
