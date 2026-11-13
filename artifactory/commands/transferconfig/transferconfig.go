@@ -352,21 +352,31 @@ func (tcc *TransferConfigCommand) importToTargetArtifactory(buffer *bytes.Buffer
 	}
 
 	// Wait for config import completion
-	return tcc.waitForImportCompletion(tcc.importer.pollingAction(importRef))
+	return tcc.waitForImportCompletion(importRef, tcc.importer.pollingAction(importRef))
 }
 
-func (tcc *TransferConfigCommand) waitForImportCompletion(pollingAction httputils.PollingAction) error {
+func (tcc *TransferConfigCommand) waitForImportCompletion(importRef string, pollingAction httputils.PollingAction) error {
 	artifactoryUrl := clientutils.AddTrailingSlashIfNeeded(tcc.TargetServerDetails.GetArtifactoryUrl())
 
+	// The polling timed out if the last action did not stop it. The type of the error cannot tell: an action may stop
+	// with the HTTP client's own retry timeout error, when a status request keeps failing.
+	pollingStopped := false
 	pollingExecutor := &httputils.PollingExecutor{
-		Timeout:         importPollingTimeout,
+		Timeout:         tcc.importer.pollingTimeout(),
 		PollingInterval: importPollingInterval,
 		MsgPrefix:       "Waiting for config import completion in Artifactory server at " + artifactoryUrl,
-		PollingAction:   pollingAction,
+		PollingAction: func() (shouldStop bool, responseBody []byte, err error) {
+			shouldStop, responseBody, err = pollingAction()
+			pollingStopped = shouldStop
+			return
+		},
 	}
 
 	body, err := pollingExecutor.Execute()
 	if err != nil {
+		if !pollingStopped {
+			return tcc.importer.pollingTimeoutError(importRef, err)
+		}
 		return err
 	}
 	log.Info(fmt.Sprintf("Logs from Artifactory:\n%s", body))

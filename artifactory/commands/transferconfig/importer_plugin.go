@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	commandsUtils "github.com/jfrog/jfrog-cli-core/v2/artifactory/commands/utils"
 	clientutils "github.com/jfrog/jfrog-client-go/utils"
@@ -23,6 +24,15 @@ type pluginImporter struct {
 
 func newPluginImporter(tcc *TransferConfigCommand) *pluginImporter {
 	return &pluginImporter{tcc: tcc}
+}
+
+func (p *pluginImporter) pollingTimeout() time.Duration {
+	return importPollingTimeout
+}
+
+// The plugin import has no status URL to point to, so the timeout is reported as is
+func (p *pluginImporter) pollingTimeoutError(_ string, timeoutErr error) error {
+	return timeoutErr
 }
 
 // Verify installation of the config-import plugin in the target server and make sure that the user is admin
